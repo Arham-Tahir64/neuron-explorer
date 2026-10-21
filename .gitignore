@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.DS_Store
+
+# sweep data and derived files
+runs/
+stats/
+captures/
+logs/
+explorer/cache/
+
+# third-party material
+source/
+tawny-owl/
+ref/
+scripts/mirror.log
