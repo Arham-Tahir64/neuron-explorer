@@ -267,3 +267,16 @@ Per-layer Spearman ρ between the two scores is 0.84–0.95. The hypothesis is d
 **The falls are mostly displacement of the prompt's own topic** ("-red yellow" on the orange prompt, "-pygame", "-enthusiasm"), not neuron-specific suppression. Rises-only carries the signal, so the explorer keeps mass.
 
 **Untested:** a lexical-free metric, i.e. embedding distance of a unit's rollouts from the control rollouts per prompt and dose. It would show whether mid neurons change structure, format, or reasoning style in ways word counts miss. It's a GPU job (about 100k rollouts with bge-small), so it belongs on a pod.
+
+## 2026-10-21 — polish pass: audit, precomputed connections, captures rebuilt
+
+**Audit.** Codex read the explorer code cold and returned 26 findings, in parallel with my own walkthrough of the UI. The ones that changed behaviour or results:
+- **Connection sign.** The "fires +/−" toggle flipped the connection sign by the source neuron's firing direction. But the score is g·u, with both g and u linear in the writer's direction, so reversing the writer leaves the product unchanged. sign(g·u) is the sign of activation the reader takes from the writer's direction, whichever way the writer fires. The toggle showed a distinction that doesn't exist, so it's gone.
+- **Activation scale and the sink.** The scale "skipped" the sink by dropping the first token. That shifts the next token into position 0, where it becomes the sink. Remeasuring on positions ≥ 1 changes 0.2% of neurons, all of them sink-loving neurons whose "fires" scores had been understated. The rest are identical.
+- **Interaction bugs.** Name autosave wrote to whichever neuron was focused when the timer fired. Chat on a random control steered the real neuron with the same index. Both are fixed.
+
+**Connections precomputed.** One weight product per layer pair, P[B, A] = (W_gate_j[B]·v_A)(W_up_j[B]·v_A), serves both directions: a column for A's downstream links, a row for B's upstream links. That's 496 pairs, about 430 TFLOP, about 20 s on a 4090, stored as top-24 per side in a 54 MB file. Against the live runtime on 741 neurons it had cached: 99.8% top-24 overlap, median |Δz| 0.005, every sign equal. The first click on a neuron fell from about 5 s to about 25 ms. Most of the old 5 s was loading every connected layer's full rollouts to label connections with words, not the connection maths itself.
+
+**Captures lost and rebuilt.** The sweep's fork captures (MLP input at layers L, L+1, L+4, L+8 at the last prompt token) were never pulled from the pods before deletion. A capture depends only on (direction, dose, prompt), because the push applies at every prompt position, so it can be rebuilt by prefill. `sweep/capture_prefill.py` does that, about 800 rollouts/s on a 4090. Against the fork's own surviving end-to-end captures (294 rollouts, 4 layers) the median relative error is 1.1–1.5% and the max 2%. That is the same bf16 band as the original HF-vs-fork equivalence check. All 32 runs are rebuilt (6.2 GB, `captures/<run>.mlp_in.npy`, rows aligned to jsonl lines). Lesson for the pipeline: pulling a sweep means runs, stats *and* captures, checked by listing every output directory the run's meta names.
+
+**Embeddings** UMAPs now exist for all 30 subset layers. Each took about 50 s of CPU-bound UMAP on the pod.
