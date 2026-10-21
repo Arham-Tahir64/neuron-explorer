@@ -7,7 +7,7 @@ runs/
 stats/
 captures/
 logs/
-explorer/cache/
+explorer/cache/connections.sqlite
 
 # third-party material
 source/
