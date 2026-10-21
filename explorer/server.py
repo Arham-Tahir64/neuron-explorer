@@ -60,18 +60,27 @@ def layer_runs():
     return {layer: path for layer, (path, _) in best.items()}
 
 
+_load_lock = threading.Lock()
+
+
 def load_layer(layer):
     path = layer_runs().get(layer)
     if path is None:
         return None
-    key = (path, os.path.getmtime(path))
-    if _cache.get(layer, {}).get("key") != key:
-        units_path = path.replace(".jsonl", ".units.jsonl")
+    units_path = path.replace(".jsonl", ".units.jsonl")
+    key = (path, os.path.getmtime(path), os.path.getmtime(units_path) if os.path.exists(units_path) else 0)
+    if _cache.get(layer, {}).get("key") == key:
+        return _cache[layer]
+    with _load_lock:
+        if _cache.get(layer, {}).get("key") == key:
+            return _cache[layer]
         if not (os.path.exists(units_path) and os.path.getmtime(units_path) >= os.path.getmtime(path)):
             full = [json.loads(l) for l in open(path)]  # ranking needs token ids; done once, then dropped
-            with open(units_path, "w") as f:
+            with open(units_path + ".tmp", "w") as f:
                 f.writelines(json.dumps(u) + "\n" for u in compute_units(full))
             del full
+            os.replace(units_path + ".tmp", units_path)
+            key = (path, os.path.getmtime(path), os.path.getmtime(units_path))
         units = [json.loads(l) for l in open(units_path)]
         # keep only what the explorer shows; token ids, logprobs and alternatives stay on disk
         slim = ("kind", "neuron", "prompt", "dose", "rel_push", "text", "finish", "n_gen")
@@ -84,7 +93,31 @@ def load_layer(layer):
             by_unit.setdefault((r["kind"], r["neuron"]), []).append(i)
         _cache[layer] = {"key": key, "path": path, "rows": rows, "units": units, "by_unit": by_unit,
                          "meta": json.load(open(path.replace(".jsonl", ".meta.json")))}
-    return _cache[layer]
+        return _cache[layer]
+
+
+_ranked = {}
+
+
+def ranked_words(layer):
+    """{neuron: top words} for the neurons of `layer` with sweep rollouts, read from the run's ranking file only."""
+    path = layer_runs().get(layer)
+    units_path = path.replace(".jsonl", ".units.jsonl") if path else None
+    if not units_path or not os.path.exists(units_path):
+        return {}
+    key = (units_path, os.path.getmtime(units_path))
+    if _ranked.get(layer, (None,))[0] != key:
+        words = {}
+        for line in open(units_path):
+            u = json.loads(line)
+            if u["kind"] == "neuron":
+                words[u["neuron"]] = [w for w, _, _ in u["words"][:4]]
+        _ranked[layer] = (key, words)
+    return _ranked[layer][1]
+
+
+def swept(layer):
+    return ranked_words(layer).keys()
 
 
 def names():
@@ -162,14 +195,12 @@ def rollout(layer: int, i: int):
 @app.get("/api/connections")
 async def connections(layer: int, n: int, k: int = 24, lens: int = 5):
     out = await asyncio.to_thread(rt.connections, layer, n, k, lens)
-    nm, info = names(), {}
+    words = await asyncio.to_thread(lambda: {l: ranked_words(l) for l in {c["layer"] for c in out["down"] + out["up"]}})
+    nm = names()
+    out = {side: [dict(c) for c in out[side]] for side in ("down", "up")}
     for c in out["down"] + out["up"]:
-        if c["layer"] not in info:
-            d = load_layer(c["layer"])
-            info[c["layer"]] = {u["neuron"]: u for u in d["units"] if u["kind"] == "neuron"} if d else {}
-        u = info[c["layer"]].get(c["n"])
         c["name"] = nm.get(f"L{c['layer']}/N{c['n']}", "")
-        c["words"] = [w for w, _, _ in u["words"][:4]] if u else []
+        c["words"] = words[c["layer"]].get(c["n"], [])
     return out
 
 
@@ -270,14 +301,16 @@ async def search(q: str, limit: int = 300):
             seen.add((row[2], row[3], row[4])); uniq.append(row)
     out = uniq
     nm, res = names(), []
+    sw = {l: swept(l) for l in {row[2] for row in out[:limit]}}
     for rank, _, l, n, sign, src in out[:limit]:
         arr = (idx if src == "lens" else st)["up" if sign == "+" else "down"]
         res.append({"layer": l, "n": n, "sign": sign, "rank": rank, "src": src, "name": nm.get(f"L{l}/N{n}", ""),
-                    "lens": [vocab[t] for t in arr[l, n, :6]]})
+                    "swept": n in sw[l], "lens": [vocab[t] for t in arr[l, n, :6]]})
     return {"ready": True, "results": res, "tokens": int(len(match)), "total": len(out)}
 
 
 ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
+MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
 
 
 @app.get("/api/fires")
@@ -315,9 +348,10 @@ _infer = {}
 async def infer(req: Request):
     """Runs text through the model and keeps every neuron's activation at every token for /api/infer/view."""
     b = await req.json()
-    if not os.path.exists(ACT_SCALE):
+    if not os.path.exists(ACT_SCALE) or rt.tok is None:
         return {"ready": False}
     ids = rt.chat_ids(b["text"]) if b.get("chat") else rt.tok(b["text"]).input_ids
+    ids = ids[:MAX_INFER_TOKENS]
     acts = await asyncio.to_thread(rt.full_activations, ids)  # [L, T, N]
     sc = np.load(ACT_SCALE)
     pos, neg = np.maximum(sc["pos"], 1e-3)[:, None, :], np.minimum(sc["neg"], -1e-3)[:, None, :]
@@ -341,11 +375,13 @@ async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 9
     if "score" not in _infer:
         return {"results": []}
     import base64
-    S, A = _infer["score"], _infer["acts"]  # [L, T, N]
+    S, A, toks = _infer["score"], _infer["acts"], _infer["toks"]  # [L, T, N]
+    if pos >= S.shape[1]:
+        return {"results": [], "total": 0}
     if pos >= 0:
         best, at = S[:, pos, :], np.full(S[:, 0, :].shape, pos)
     else:
-        at = np.abs(S).argmax(1)  # [L, N]
+        at = S.argmax(1) if sign == "+" else S.argmin(1) if sign == "-" else np.abs(S).argmax(1)  # [L, N]
         best = np.take_along_axis(S, at[:, None, :], 1)[:, 0, :]
     view = best.copy()
     keep = np.abs(best) >= min
@@ -369,7 +405,7 @@ async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 9
         lens = [vocab[k] for k in (idx["up"] if sg == "+" else idx["down"])[l, n, :6]] if idx is not None else []
         t = int(at[l, n])
         res.append({"layer": l, "n": n, "sign": sg, "score": round(float(abs(best[l, n])), 2),
-                    "act": round(float(A[l, t, n]), 2), "token": _infer["toks"][t], "pos": t,
+                    "act": round(float(A[l, t, n]), 2), "token": toks[t], "pos": t,
                     "name": nm.get(f"L{l}/N{n}", ""), "lens": lens})
     blob = base64.b64encode(view.astype(np.float16).tobytes()).decode()
     return {"results": res, "total": int(keep.sum()), "map": blob, "shape": list(view.shape)}

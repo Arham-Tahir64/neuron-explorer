@@ -1,8 +1,13 @@
-import { createMap } from "./map3d.js?v=37";
-import { createScatter } from "./scatter.js?v=37";
+import { createMap } from "./map3d.js?v=39";
+import { createScatter } from "./scatter.js?v=39";
 
 const $ = s => document.querySelector(s);
-const api = (p, body) => fetch(p, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}).then(r => r.json());
+const api = async (p, body) => {
+  const r = await fetch(p, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  if (!r.ok) throw new Error(`${p.split("?")[0]} ${r.status}: ${(await r.text()).slice(0, 160)}`);
+  return r.json();
+};
+addEventListener("unhandledrejection", e => { const el = document.querySelector("#status"); if (el) el.textContent = String(e.reason?.message || e.reason); });
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
@@ -20,7 +25,7 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
   onLayerMode: l => {
     $("#layer-back").classList.toggle("on", l !== null);
     $("#layer-back").textContent = l !== null ? `‹ all layers  ·  L${l}` : "";
-    if (l !== null && l !== state.layer) setLayer(l, false);
+    if (l !== null && l !== state.layer) setLayer(l);
   },
   onHover: (p, x, y) => {
     if (!p) return hideTip();
@@ -69,11 +74,14 @@ document.body.appendChild(tip);
 
 // ---------- sheet layout ----------
 const layouts = {};
+let wantLayout = null;
 async function setLayout(kind) {
+  wantLayout = kind;
   document.querySelectorAll("#layout-mode button").forEach(b => b.classList.toggle("on", b.dataset.k === kind));
   if (kind === "index") { map.setLayout(null); return; }
   if (!layouts[kind]) {
     const r = await api(`/api/layout?kind=${kind}`);
+    if (wantLayout !== kind) return;
     if (!r.available) { document.querySelectorAll("#layout-mode button").forEach(b => b.classList.toggle("on", b.dataset.k === "index")); map.setLayout(null); return; }
     const bin = atob(r.cell), a = new Int16Array(bin.length / 2);
     for (let i = 0; i < a.length; i++) a[i] = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
@@ -86,15 +94,21 @@ setLayout("writes");
 
 // ---------- scatter ----------
 const scatter = createScatter($("#scatter"), {
-  onPick: i => { const d = scatter.data; if (d.kind[i] === "neuron") openNeuron(state.layer, d.neuron[i]); },
+  onPick: i => { const d = scatter.data; if (d.kind[i] === "neuron") openNeuron(d.layer, d.neuron[i]); },
   onHover: async (i, x, y) => {
-    if (i < 0) return hideTip();
-    const d = scatter.data, head = `${d.kind[i] === "baseline" ? "baseline" : (d.kind[i] === "random" ? "random " : "N") + d.neuron[i]} · ${d.prompt[i]} · ${fmtDose(d.dose[i])}`;
+    if (i < 0) { scatterHover = null; return hideTip(); }
+    const d = scatter.data, layer = d.layer, key = `${layer}/${d.row[i]}`;
+    const head = `${d.kind[i] === "baseline" ? "baseline" : (d.kind[i] === "random" ? "random " : "N") + d.neuron[i]} · ${d.prompt[i]} · ${fmtDose(d.dose[i])}`;
+    scatterHover = key;
+    if (rolloutCache.has(key)) return showTip(x, y, head, rolloutCache.get(key));
     showTip(x, y, head, "…");
-    const r = await api(`/api/rollout?layer=${state.layer}&i=${d.row[i]}`);
-    if (tip.style.display === "block") showTip(x, y, head, r.text.slice(0, 500));
+    const r = await api(`/api/rollout?layer=${layer}&i=${d.row[i]}`);
+    rolloutCache.set(key, r.text.slice(0, 500));
+    if (scatterHover === key && state.view === "embed") showTip(x, y, head, rolloutCache.get(key));
   },
 });
+let scatterHover = null;
+const rolloutCache = new Map();
 document.querySelectorAll("#color-by button").forEach(b => b.onclick = () => {
   document.querySelectorAll("#color-by button").forEach(x => x.classList.toggle("on", x === b));
   scatter.setColorBy(b.dataset.c);
@@ -115,22 +129,30 @@ for (let l = 0; l < arch.n_layers; l++) {
   o.textContent = `L${l}${index.layers[l] ? "" : " ·"}`;
   layerSel.appendChild(o);
 }
-layerSel.onchange = () => { setLayer(+layerSel.value, false); map.enterLayer(+layerSel.value); };
+layerSel.onchange = () => { setLayer(+layerSel.value); map.enterLayer(+layerSel.value); };
 
-async function setLayer(l, fly) {
+async function setLayer(l) {
   state.layer = l; layerSel.value = l;
+  if (scatter.data && scatter.data.layer !== l) { scatter.setData(null); hideTip(); }
+  try { localStorage.setItem("ne.layer", l); } catch {}
   if (!state.units[l]) {
-    state.units[l] = index.layers[l] ? await api(`/api/units?layer=${l}`) : [];
-    state.unitMap[l] = new Map(state.units[l].filter(u => u.kind === "neuron").map(u => [u.n, u]));
-    if (state.units[l].length) map.setUnits(l, state.units[l]);
+    if (!lensResults) $("#rows").innerHTML = `<li class="head">…</li>`;
+    const us = index.layers[l] ? await api(`/api/units?layer=${l}`) : [];
+    state.units[l] = us;
+    state.unitMap[l] = new Map(us.filter(u => u.kind === "neuron").map(u => [u.n, u]));
+    if (us.length) map.setUnits(l, us);
+    if (state.layer !== l) return;
   }
   renderList();
-  if (fly) map.focusLayer(l);
   if (state.view === "embed") loadEmbeddings();
 }
 async function loadEmbeddings() {
-  const d = index.layers[state.layer] ? await api(`/api/embeddings?layer=${state.layer}`) : {};
-  scatter.setData(d.x ? d : null);
+  const l = state.layer;
+  $("#embed-empty").textContent = "…";
+  const d = index.layers[l] ? await api(`/api/embeddings?layer=${l}`) : {};
+  if (state.layer !== l) return;
+  $("#embed-empty").textContent = d.x ? "" : "—";
+  scatter.setData(d.x ? { ...d, layer: l } : null);
   scatter.select(state.layer, state.focus?.layer === state.layer ? state.focus.n : null);
 }
 
@@ -149,16 +171,19 @@ document.querySelectorAll("#q-mode button").forEach(b => b.onclick = () => {
 });
 // fires: run text through the model once, then filter what fired without re-running
 state.inf = { text: null, pos: -1, sign: "both" };
-async function runInfer(text) {
+let qGen = 0;
+const stillWanted = (g, mode, q) => g === qGen && state.qMode === mode && $("#lens-q").value.trim() === q;
+async function runInfer(text, g) {
   $("#list").classList.add("fires");
   if (text !== state.inf.text) {
     $("#rows").innerHTML = `<li class="head">running…</li>`;
     const r = await api("/api/infer", { text });
+    if (!stillWanted(g, "fires", text)) return;
     if (!r.ready) { $("#rows").innerHTML = `<li class="head">${esc(state.statusText || "measuring neuron ranges")}</li>`; return; }
     state.inf = { ...state.inf, text, pos: -1, tokens: r.tokens };
     $("#inf-toks").innerHTML = r.tokens.map((t, i) => `<button data-i="${r.pos[i]}">${esc(t)}</button>`).join("");
   }
-  await inferView();
+  await inferView(g);
 }
 $("#inf-toks").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
@@ -173,11 +198,13 @@ document.querySelectorAll("#inf-sign button").forEach(b => b.onclick = () => {
 });
 let infTimer;
 for (const id of ["#inf-lo", "#inf-hi", "#inf-min", "#inf-q"]) $(id).addEventListener("input", () => { clearTimeout(infTimer); infTimer = setTimeout(inferView, 200); });
-async function inferView() {
-  const f = state.inf;
+let viewGen = 0;
+async function inferView(g = qGen) {
+  const f = state.inf, mine = ++viewGen;
   const qs = new URLSearchParams({ pos: f.pos, sign: f.sign, lo: $("#inf-lo").value || 0, hi: $("#inf-hi").value || 99,
     min: $("#inf-min").value || 0, q: $("#inf-q").value, limit: 300 });
   const r = await api(`/api/infer/view?${qs}`);
+  if (mine !== viewGen || g !== qGen || state.qMode !== "fires") return;
   const marks = [];
   if (r.map) {
     const bin = atob(r.map), u16 = new Uint16Array(bin.length / 2);
@@ -199,12 +226,12 @@ function halfToFloat(h) {
 }
 
 async function runLensSearch() {
-  const q = $("#lens-q").value.trim();
+  const q = $("#lens-q").value.trim(), g = ++qGen;
   if (state.qMode !== "fires") $("#list").classList.remove("fires");
   if (q.length < 2) { lensResults = null; $("#list").classList.remove("fires"); map.setMarks([]); renderList(); return; }
-  if (state.qMode === "fires") return runInfer(q);
+  if (state.qMode === "fires") return runInfer(q, g);
   const r = await api(`/api/search?q=${encodeURIComponent(q)}&limit=400`);
-  if ($("#lens-q").value.trim() !== q) return;
+  if (!stillWanted(g, "lens", q)) return;
   lensResults = r;
   map.setMarks(r.results || []);
   if ($("#list").classList.contains("hidden")) setListHidden(false);
@@ -229,7 +256,7 @@ function renderList() {
 function renderLensResults() {
   const r = lensResults;
   if (!r.ready) { $("#rows").innerHTML = `<li class="head">${esc(state.statusText || "indexing lens")}</li>`; return; }
-  const rows = (r.results || []).map(x => `<li class="res" data-l="${x.layer}" data-n="${x.n}" data-kind="neuron">
+  const rows = (r.results || []).map(x => `<li class="res${x.swept === false ? " unswept" : ""}" data-l="${x.layer}" data-n="${x.n}" data-kind="neuron">
     <span class="n">L${x.layer} N${x.n}</span><span class="sg ${x.sign === "+" ? "up" : "down"}">${r.fires ? `${x.sign === "+" ? "" : "−"}${x.score.toFixed(1)}×` : `${x.sign === "+" ? "+" : "−"}${x.rank + 1}`}</span>
     <span class="w">${r.fires ? `<span class="tk">"${esc(x.token)}"</span>` : ""}${x.name ? `<b>${esc(x.name)}</b> ` : ""}${esc(x.lens.join(" "))}</span></li>`).join("");
   const head = r.fires ? `${r.total ?? 0} neurons pass · score = activation ÷ its typical extreme` : `${r.total ?? 0} neurons · ${r.tokens ?? 0} tokens`;
@@ -279,7 +306,7 @@ $("#focus-tab").onclick = () => setFocusCollapsed(false);
 
 // ---------- focus panel ----------
 const focusEl = $("#focus");
-$("#f-close").onclick = () => { focusEl.classList.remove("on"); setFocusCollapsed(false); updateInsets(); state.focus = null; map.select(null); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
+$("#f-close").onclick = () => { flushName(); if (running) running.abort(); focusEl.classList.remove("on"); setFocusCollapsed(false); updateInsets(); state.focus = null; map.select(null); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
 function setTab(t) {
   document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("on", x.dataset.tab === t));
@@ -287,8 +314,10 @@ function setTab(t) {
 }
 
 async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
-  if (layer !== state.layer) await setLayer(layer, false);
+  flushName();
+  if (running) running.abort();
   state.focus = { layer, n, kind };
+  if (map.layerMode !== null && map.layerMode !== layer) map.enterLayer(layer);
   if (push && kind === "neuron") history.replaceState(null, "", `#L${layer}/N${n}`);
   focusEl.classList.add("on");
   setFocusCollapsed(false);
@@ -299,10 +328,15 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   $("#f-name").disabled = kind !== "neuron";
   $("#tab-examples").innerHTML = ""; $("#tab-details").innerHTML = "";
   state.thread = []; renderThread(); $("#c-reads").innerHTML = ""; $("#c-lens").innerHTML = "";
+  document.querySelector('#tabs button[data-tab="chat"]').style.display = kind === "neuron" ? "" : "none";
+  if (kind !== "neuron" && document.querySelector("#tabs button.on")?.dataset.tab === "chat") setTab("examples");
+  if (layer !== state.layer) await setLayer(layer);
+  if (!isFocus(layer, n, kind)) return;
+  $("#f-name").value = state.unitMap[layer]?.get(n)?.name || "";
   renderList();
   if (kind === "neuron") { map.select(layer, n, fly); scatter.select(layer, n); }
   const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`);
-  if (!state.focus || state.focus.n !== n) return;
+  if (!isFocus(layer, n, kind)) return;
   $("#f-name").value = u.name || "";
   if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "—"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${(u.stats.null_pct * 100).toFixed(0)}%`;
   renderExamples(u);
@@ -312,6 +346,8 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   if (!hasRollouts && document.querySelector("#tabs button.on")?.dataset.tab === "examples") setTab("details");
   if (kind === "neuron") loadLive(layer, n);
 }
+
+const isFocus = (layer, n, kind) => state.focus && state.focus.layer === layer && state.focus.n === n && state.focus.kind === kind;
 
 function renderExamples(u) {
   if (!u.rollouts || !u.rollouts.length) { $("#tab-examples").innerHTML = `<div class="slot">—</div>`; return; }
@@ -356,53 +392,61 @@ function renderDetails(u) {
 async function loadLive(layer, n) {
   $("#d-lens") && ($("#d-lens").textContent = "…");
   $("#d-con") && ($("#d-con").textContent = "…");
-  const [lens, con] = await Promise.all([api(`/api/lens?layer=${layer}&n=${n}`), api(`/api/connections?layer=${layer}&n=${n}&k=24`)]);
-  if (!state.focus || state.focus.n !== n || state.focus.layer !== layer) return;
-  map.setConnections(con);
+  const conP = api(`/api/connections?layer=${layer}&n=${n}&k=24`);
+  let lens;
+  try { lens = await api(`/api/lens?layer=${layer}&n=${n}`); }
+  catch (err) { if (isFocus(layer, n, "neuron") && $("#d-lens")) $("#d-lens").textContent = err.message; }
+  if (!isFocus(layer, n, "neuron")) return;
+  conP.then(con => {
+    if (!isFocus(layer, n, "neuron")) return;
+    map.setConnections(con); state.con = con; renderConnections();
+  }, err => { if (isFocus(layer, n, "neuron") && $("#d-con")) $("#d-con").textContent = err.message; });
+  if (!lens) return;
   const tok = t => `<span class="tok">${esc(t)}</span>`;
   const steer = lens.steer_up ? `<div class="lab">steer lens</div><div class="lens"><div class="up"><div class="lab">+ push · KL ${lens.kl_up}</div>${lens.steer_up.map(tok).join("")}</div><div class="down"><div class="lab">− push · KL ${lens.kl_down}</div>${lens.steer_down.map(tok).join("")}</div></div><div class="lab" style="margin-top:14px">logit lens</div>` : "";
   if ($("#d-lens")) $("#d-lens").outerHTML = `${steer}<div class="lens"><div class="up"><div class="lab">+</div>${lens.up.map(tok).join("")}</div><div class="down"><div class="lab">−</div>${lens.down.map(tok).join("")}</div></div>`;
-  state.con = con;
-  renderConnections();
   const words = state.unitMap[layer]?.get(n)?.words || [];
   $("#c-lens").innerHTML = (words.length ? `<div class="words">${esc(words.join("  "))}</div>` : "") +
     (lens.steer_up ? `<div><span class="sgn up">+</span>${esc(lens.steer_up.slice(0, 10).join("  "))}</div><div><span class="sgn down">−</span>${esc(lens.steer_down.slice(0, 10).join("  "))}</div>` : "") +
     `<div class="faintline"><span class="sgn up">+</span>${esc(lens.up.slice(0, 10).join("  "))}</div><div class="faintline"><span class="sgn down">−</span>${esc(lens.down.slice(0, 10).join("  "))}</div>`;
 }
 
-// sign of the source's firing (+1 / -1) x connection sign decides which pole of the other neuron is involved:
-// downstream, the pole it gets pushed toward; upstream, the pole that drives this neuron in the chosen direction
+// sign = sign(g * u): the sign of the reading neuron's activation that the writing neuron's direction produces on its
+// own. Reversing the writer reverses g and u together, so the sign holds for either direction of the writer.
 function renderConnections() {
   const el = $("#d-con") || $("#d-con-wrap"); if (!el || !state.con) return;
-  const fire = state.conFire || 1, tok = t => `<span class="tok">${esc(t)}</span>`;
+  const tok = t => `<span class="tok">${esc(t)}</span>`;
   const row = c => {
-    const pole = c.sign * fire > 0 ? 1 : -1, toks = (pole > 0 ? c.lens : c.lens_neg) || [];
+    const pole = c.sign > 0 ? 1 : -1, toks = (pole > 0 ? c.lens : c.lens_neg) || [];
     const sweep = c.name || (c.words || []).join(" ");
     return `<tr data-l="${c.layer}" data-n="${c.n}" class="con"><td class="pole ${pole > 0 ? "up" : "down"}">${pole > 0 ? "↑" : "↓"}</td>
       <td>${toks.slice(0, 4).map(tok).join("")}${sweep ? `<div class="dim">${esc(sweep)}</div>` : ""}</td>
       <td class="num dim">${c.z.toFixed(0)}</td><td class="mono faint">L${c.layer}·${c.n}</td></tr>`;
   };
   el.outerHTML = `<div id="d-con-wrap">
-    <span class="seg" id="con-fire"><button data-f="1" class="${fire > 0 ? "on" : ""}">fires +</button><button data-f="-1" class="${fire < 0 ? "on" : ""}">fires −</button></span>
-    <div class="lens" style="margin-top:10px"><div><div class="lab">writes into</div><table class="dtable">${state.con.down.slice(0, 14).map(row).join("")}</table></div>
+    <div class="lens"><div><div class="lab">writes into</div><table class="dtable">${state.con.down.slice(0, 14).map(row).join("")}</table></div>
     <div><div class="lab">driven by</div><table class="dtable">${state.con.up.slice(0, 14).map(row).join("")}</table></div></div></div>`;
-  document.querySelectorAll("#con-fire button").forEach(b => b.onclick = () => { state.conFire = +b.dataset.f; renderConnections(); });
 }
 $("#tab-details").addEventListener("click", e => { const tr = e.target.closest("tr[data-l]"); if (tr) openNeuron(+tr.dataset.l, +tr.dataset.n); });
 
 // name autosave
-let nameTimer;
-$("#f-name").addEventListener("input", () => {
+let nameTimer, pendingName = null;
+async function saveName(p) {
+  await api("/api/name", { layer: p.layer, n: p.n, name: p.name });
+  const u = state.unitMap[p.layer]?.get(p.n); if (u) u.name = p.name.trim();
+  if (state.units[p.layer]?.length) map.setUnits(p.layer, state.units[p.layer]);
+  renderList();
+  if (isFocus(p.layer, p.n, "neuron")) { $("#f-name").classList.add("saved"); setTimeout(() => $("#f-name").classList.remove("saved"), 900); }
+}
+function flushName() {
   clearTimeout(nameTimer);
-  nameTimer = setTimeout(async () => {
-    const f = state.focus; if (!f) return;
-    const name = $("#f-name").value;
-    await api("/api/name", { layer: f.layer, n: f.n, name });
-    const u = state.unitMap[f.layer]?.get(f.n); if (u) u.name = name.trim();
-    if (state.units[f.layer]?.length) map.setUnits(f.layer, state.units[f.layer]);
-    renderList();
-    $("#f-name").classList.add("saved"); setTimeout(() => $("#f-name").classList.remove("saved"), 900);
-  }, 500);
+  if (pendingName) { const p = pendingName; pendingName = null; saveName(p); }
+}
+$("#f-name").addEventListener("input", () => {
+  const f = state.focus; if (!f || f.kind !== "neuron") return;
+  pendingName = { layer: f.layer, n: f.n, name: $("#f-name").value };
+  clearTimeout(nameTimer);
+  nameTimer = setTimeout(flushName, 500);
 });
 
 // ---------- chat ----------
@@ -449,6 +493,7 @@ function renderThread() {
   el.scrollTop = el.scrollHeight;
 }
 $("#c-clear").onclick = () => { if (running) running.abort(); state.thread = []; renderThread(); };
+let reading = false;
 
 $("#c-form").addEventListener("submit", async e => {
   e.preventDefault();
@@ -461,10 +506,12 @@ $("#c-form").addEventListener("submit", async e => {
   const turn = { user: text, replies: ["", "", ""], done: [false, false, false], dose, mode: state.chat.mode, live: true };
   state.thread.push(turn); $("#c-input").value = ""; renderThread();
   const cols = [...$("#c-thread").lastElementChild.querySelectorAll(".col")];
-  running = new AbortController(); $("#c-go").textContent = "stop";
+  const ctl = new AbortController(), thread = state.thread;
+  running = ctl; $("#c-go").textContent = "stop";
   try {
-    const res = await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, signal: running.signal,
+    const res = await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
       body: JSON.stringify({ layer: f.layer, n: f.n, prompt: text, dose, mode: state.chat.mode, history }) });
+    if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 160)}`);
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = "";
     for (;;) {
@@ -486,15 +533,19 @@ $("#c-form").addEventListener("submit", async e => {
     if (err.name !== "AbortError") turn.error = String(err);
   } finally {
     turn.live = false; turn.done = [true, true, true];
-    running = null; $("#c-go").textContent = "run";
-    renderThread();
+    if (running === ctl) { running = null; $("#c-go").textContent = "run"; }
+    if (state.thread === thread) renderThread();
   }
 });
 
 async function runReads(f, text) {
-  $("#c-go").textContent = "…";
-  const r = await api("/api/reads", { layer: f.layer, n: f.n, text, chat: true });
-  $("#c-go").textContent = "run";
+  if (reading) return;
+  reading = true; $("#c-go").textContent = "…";
+  let r;
+  try { r = await api("/api/reads", { layer: f.layer, n: f.n, text, chat: true }); }
+  catch (err) { $("#c-reads").textContent = err.message; return; }
+  finally { reading = false; $("#c-go").textContent = "run"; }
+  if (!isFocus(f.layer, f.n, "neuron")) return;
   const m = Math.max(1e-6, ...r.units.map(u => Math.abs(u.act)));
   $("#c-reads").innerHTML = r.units.map(u => {
     const a = u.act / m, c = a >= 0 ? `rgba(255,181,71,${a * 0.85})` : `rgba(255,79,154,${-a * 0.85})`;
@@ -514,6 +565,8 @@ pollStatus();
 
 window.__ne = { map, state, scatter };
 // ---------- start ----------
-const first = Object.keys(index.layers).map(Number)[0] ?? 0;
-await setLayer(first, false);
+const have = Object.keys(index.layers).map(Number);
+let saved = null; try { const v = localStorage.getItem("ne.layer"); if (v !== null) saved = +v; } catch {}
+const first = have.includes(saved) ? saved : have.includes(22) ? 22 : (have[0] ?? 0);
+await setLayer(first);
 if (location.hash) fromHash();

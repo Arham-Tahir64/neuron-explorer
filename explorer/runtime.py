@@ -34,6 +34,7 @@ class Runtime:
         self._db.execute("CREATE TABLE IF NOT EXISTS con (key TEXT PRIMARY KEY, val TEXT)")
         self._db_lock = threading.Lock()
         self._lens_idx = None
+        self._con_idx = None
         self.lock = threading.Lock()
         self.model = self.tok = None
         self.status = "idle"
@@ -43,6 +44,7 @@ class Runtime:
         self._seen = {}
         self._con_cache = {}
         self._capture_all = None
+        self._capture_from = 0
         self._capture_full = None
         self._lens_cache = {}
 
@@ -69,7 +71,7 @@ class Runtime:
             if self._capture_full is not None:
                 self._capture_full[i] = h[0].float().cpu()  # [tokens, inter]
             if self._capture_all is not None:
-                a = h.float().flatten(0, 1)  # [tokens, inter]
+                a = h[:, self._capture_from:].float().flatten(0, 1)  # [tokens, inter]
                 mx, amx = a.max(0)
                 mn, amn = a.min(0)
                 self._capture_all[i] = (mx.cpu(), amx.cpu(), mn.cpu(), amn.cpu())
@@ -126,23 +128,27 @@ class Runtime:
         Yields (row, text_delta), then (None, None)."""
         self.ensure_loaded()
         with self.lock:
-            if mode == "mul":
-                vals = torch.tensor([dose, 1.0, -dose], device=self.dev)
-            else:
-                unit = self.layer_resid_p50(layer) / float(self.down_col(layer, n).norm())
-                vals = torch.tensor([dose * unit, 0.0, -dose * unit], device=self.dev)
-            self._push = (layer, n, mode, vals)
-            seqs = [self.messages_ids(m) for m in rows_messages]
-            T = max(map(len, seqs))
-            pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
-            ids = torch.tensor([[pad] * (T - len(q)) + q for q in seqs], device=self.dev)
-            mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
-            pos = (mask.cumsum(-1) - 1).clamp(min=0)
-            eos = self.tok.convert_tokens_to_ids("<|im_end|>")
-            done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
+            if cancel is not None and cancel.is_set():
+                yield None, None
+                return
             try:
+                if mode == "mul":
+                    vals = torch.tensor([dose, 1.0, -dose], device=self.dev)
+                else:
+                    unit = self.layer_resid_p50(layer) / float(self.down_col(layer, n).norm())
+                    vals = torch.tensor([dose * unit, 0.0, -dose * unit], device=self.dev)
+                seqs = [self.messages_ids(m) for m in rows_messages]
+                T = max(map(len, seqs))
+                pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+                ids = torch.tensor([[pad] * (T - len(q)) + q for q in seqs], device=self.dev)
+                mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
+                pos = (mask.cumsum(-1) - 1).clamp(min=0)
+                eos = self.tok.convert_tokens_to_ids("<|im_end|>")
+                done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
+                self._push = (layer, n, mode, vals)
                 with torch.inference_mode():
-                    out = self.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=True)
+                    out = self.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=True,
+                                     logits_to_keep=1)
                     for _ in range(max_new):
                         if cancel is not None and cancel.is_set():
                             break
@@ -164,7 +170,7 @@ class Runtime:
                         mask = torch.cat([mask, torch.ones_like(mask[:, :1])], -1)
                         pos = pos[:, -1:] + 1
                         out = self.model(input_ids=nxt[:, None], attention_mask=mask, position_ids=pos,
-                                         past_key_values=out.past_key_values, use_cache=True)
+                                         past_key_values=out.past_key_values, use_cache=True, logits_to_keep=1)
             finally:
                 self._push = None
         yield None, None
@@ -211,6 +217,18 @@ class Runtime:
             vals = [act[i] for i in idx]
             units.append({"text": text, "act": max(vals, key=abs), "pieces": vals})
         return {"units": units}
+
+    def con_index(self):
+        """Precomputed connections (build_connections.py), loaded once."""
+        if self._con_idx is None:
+            path = os.path.join(CACHE, "connections.npz")
+            if os.path.exists(path):
+                z = np.load(path)
+                self._con_idx = {key: z[key] for key in z.files}
+                self._con_idx["k"] = int(z["k"])
+            else:
+                self._con_idx = False
+        return self._con_idx or None
 
     # ---------- logit lens ----------
     def lens_index(self):
@@ -260,6 +278,21 @@ class Runtime:
         key = (layer, n, k, lens_k)
         if key in self._con_cache:
             return self._con_cache[key]
+        ci = self.con_index()
+        if ci is not None and k <= ci["k"]:
+            out = {}
+            for side in ("down", "up"):
+                z = ci[f"{side}_z"][layer, n]
+                out[side] = [{"layer": int(ci[f"{side}_layer"][layer, n, i]), "n": int(ci[f"{side}_n"][layer, n, i]),
+                              "z": round(float(z[i]), 2), "sign": int(ci[f"{side}_sign"][layer, n, i])}
+                             for i in range(k) if z[i] > -1e4]
+            idx = self.lens_index()
+            if lens_k and idx is not None:
+                v = self.vocab_strings()
+                for c in out["down"] + out["up"]:
+                    c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
+                    c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
+            return out
         dkey = f"{layer}:{n}:{k}:{lens_k}"
         with self._db_lock:
             row = self._db.execute("SELECT val FROM con WHERE key = ?", (dkey,)).fetchone()
@@ -351,17 +384,18 @@ class Runtime:
         return self._vocab
 
     # ---------- which neurons fire on a text ----------
-    def all_activations(self, ids):
-        """Per layer: (max, argmax, min, argmin) over tokens for every neuron, on token ids [T] or [B, T]."""
+    def all_activations(self, ids, skip_first=False):
+        """Per layer: (max, argmax, min, argmin) over tokens for every neuron, on token ids [T] or [B, T]. With
+        skip_first, position 0 (the attention sink) is left out and argmax/argmin count from position 1."""
         self.ensure_loaded()
         with self.lock, torch.inference_mode():
-            self._capture_all = {}
+            self._capture_all, self._capture_from = {}, int(skip_first)
             try:
                 x = torch.tensor(ids, device=self.dev)
                 self.lm(input_ids=x if x.dim() == 2 else x[None], use_cache=False)
                 return self._capture_all
             finally:
-                self._capture_all = None
+                self._capture_all, self._capture_from = None, 0
 
     def build_act_scale(self, path, tokens=10000, seq=512, seed=0):
         """Each neuron's largest positive and most negative activation over web text (positions >= 1)."""
@@ -375,7 +409,7 @@ class Runtime:
             while len(buf) >= seq and seen < tokens:
                 chunk, buf = buf[:seq], buf[seq:]
                 self.status = f"measuring neuron ranges {seen // 1000}k/{tokens // 1000}k tokens"
-                acts = self.all_activations(chunk[1:])
+                acts = self.all_activations(chunk, skip_first=True)
                 for l, (mx, _, mn, _) in acts.items():
                     pos[l] = np.maximum(pos[l], mx.numpy()); neg[l] = np.minimum(neg[l], mn.numpy())
                 seen += seq

@@ -267,7 +267,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     if (dx * fade.side / GAP > 0.45) return 1 - fade.amt;
     return 1 - 0.75 * fade.amt * (1 - Math.exp(-d * d));
   };
-  let layerMode = null, saved = null;
+  let layerMode = null, saved = null, lastMarks = [];
   function enterLayer(l) {
     if (layerMode === null) saved = { pos: camera.position.clone(), tgt: controls.target.clone() };
     layerMode = l;
@@ -389,6 +389,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     focusLayer() {},
     setLayout(cells) {
       layoutCells = cells;
+      this.setMarks(lastMarks);
       for (let l = 0; l < L; l++) for (let n = 0; n < N; n++) {
         const p = neuronPos(l, n), k = (l * N + n) * 3;
         pos[k] = p.x; pos[k + 1] = p.y; pos[k + 2] = p.z;
@@ -401,6 +402,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     get layerMode() { return layerMode; },
     home() { flyTo(home.target, homeDist); },
     setMarks(marks) {
+      lastMarks = marks;
       const p = [], c = [], up = new THREE.Color(1.0, 0.71, 0.28), down = new THREE.Color(1.0, 0.31, 0.6);
       for (const m of marks) {
         const v = neuronPos(m.layer, m.n), k = (m.sign === "-" ? down : up).clone().multiplyScalar(m.w ?? 1);
