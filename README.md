@@ -8,7 +8,8 @@ rollout is kept, and the explorer lays the results out over a 3D view of the mod
     uv sync
     uv run python explorer/server.py        # http://localhost:8791
 
-Reads sweep runs from `runs/` and per-layer stats from `stats/`. Loads Qwen3.5-4B locally (MPS, CUDA or CPU) for live
+Reads sweep runs from `runs/` and per-layer stats from `stats/`, both produced by the sweep below; the caches in
+`explorer/cache/` ship with the repo. Loads Qwen3.5-4B locally (MPS, CUDA or CPU) for live
 steered chat, lens, connections and live inference over your own text.
 
 - **map**: the model's layers in perspective, attention and MLP per layer, one point per neuron. Hover shows a neuron's
