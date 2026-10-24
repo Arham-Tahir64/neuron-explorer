@@ -15,6 +15,7 @@ import torch
 from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
 MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
+NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
     "and by the twelfth century the town had a market, a bridge, and a quarrel with its neighbours over tolls. "
@@ -39,7 +40,8 @@ class Runtime:
         self.model = self.tok = None
         self.status = "idle"
         self.resid_p50 = {}
-        self._push = None  # (layer, neuron, mode, per-row values tensor)
+        self._push = None  # [(layer, neuron, mode, per-row values tensor)], any number of neurons at once (neuron None = all)
+        self._heads = None  # [(layer, head, scale)]: attention heads scaled (0 = ablated) during a read; head None = all
         self._read = None  # (layer, neuron) while reading
         self._seen = {}
         self._con_cache = {}
@@ -52,6 +54,8 @@ class Runtime:
     def ensure_loaded(self):
         if self.model is not None:
             return
+        if NO_MODEL:
+            raise RuntimeError("live model disabled (EXPLORER_NO_MODEL)")
         with self.lock:
             if self.model is not None:
                 return
@@ -63,6 +67,14 @@ class Runtime:
             for i, layer in enumerate(self.lm.layers):
                 layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
                 layer.register_forward_hook(self._resid_hook(i))
+                # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
+                # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
+                if hasattr(layer, "self_attn"):
+                    a = layer.self_attn
+                    a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
+                else:
+                    a = layer.linear_attn
+                    a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
             self.status = "ready"
 
     def _hook(self, i):
@@ -78,15 +90,37 @@ class Runtime:
             if self._read is not None and self._read[0] == i:
                 n = self._read[1]
                 self._seen["act"] = h[0, :, n].float().cpu()
-            if self._push is not None and self._push[0] == i:
-                _, n, mode, vals = self._push
+            mine = [p for p in self._push if p[0] == i] if self._push else []
+            if mine:
                 h = h.clone()
-                if mode == "mul":
-                    h[:, :, n] = h[:, :, n] * vals[:, None].to(h.dtype)
-                else:
-                    h[:, :, n] = h[:, :, n] + vals[:, None].to(h.dtype)
+                for _, n, mode, vals in mine:
+                    if n is None:  # the whole layer's MLP (multiply only)
+                        h = h * vals[:, None, None].to(h.dtype)
+                    elif mode == "mul":
+                        h[:, :, n] = h[:, :, n] * vals[:, None].to(h.dtype)
+                    else:
+                        h[:, :, n] = h[:, :, n] + vals[:, None].to(h.dtype)
                 return (h,)
         return hook
+
+    def _head_hook(self, i, n_heads):
+        def hook(mod, inp):
+            mine = [x for x in self._heads if x[0] == i] if self._heads else []
+            if not mine:
+                return None
+            h = inp[0].clone()
+            v = h.view(*h.shape[:-1], n_heads, h.shape[-1] // n_heads)
+            for _, head, scale in mine:
+                if head is None:
+                    v.mul_(scale)
+                else:
+                    v[..., head, :] *= scale
+            return (h,)
+        return hook
+
+    def n_heads(self, layer):
+        L = self.lm.layers[layer]
+        return L.self_attn.o_proj.in_features // L.self_attn.head_dim if hasattr(L, "self_attn") else L.linear_attn.num_v_heads
 
     def _resid_hook(self, i):
         def hook(mod, inp, out):
@@ -126,17 +160,18 @@ class Runtime:
         """Greedy-decodes three conversations in one batch: row 0 pushed up, row 1 unsteered, row 2 pushed down.
         rows_messages holds each row's own message list (the rows can differ in length; they are left-padded).
         Yields (row, text_delta), then (None, None)."""
+        yield from self.steer_multi([(layer, n, dose, mode)], rows_messages, max_new, cancel)
+
+    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None):
+        """steer_stream for any number of neurons at once: pushes = [(layer, n, dose, mode)], all applied together.
+        Each is reversed in row 2 the same way a single neuron is (add: -dose; mul: x -dose)."""
         self.ensure_loaded()
         with self.lock:
             if cancel is not None and cancel.is_set():
                 yield None, None
                 return
             try:
-                if mode == "mul":
-                    vals = torch.tensor([dose, 1.0, -dose], device=self.dev)
-                else:
-                    unit = self.layer_resid_p50(layer) / float(self.down_col(layer, n).norm())
-                    vals = torch.tensor([dose * unit, 0.0, -dose * unit], device=self.dev)
+                push = [self._push_entry(layer, n, dose, mode, (1, 0, -1)) for layer, n, dose, mode in pushes]
                 seqs = [self.messages_ids(m) for m in rows_messages]
                 T = max(map(len, seqs))
                 pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
@@ -145,7 +180,7 @@ class Runtime:
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
                 eos = self.tok.convert_tokens_to_ids("<|im_end|>")
                 done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
-                self._push = (layer, n, mode, vals)
+                self._push = push
                 with torch.inference_mode():
                     out = self.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=True,
                                      logits_to_keep=1)
@@ -197,8 +232,25 @@ class Runtime:
         return merged
 
     # ---------- reading ----------
-    def read(self, layer, n, text, chat=True):
-        """Per-token activation of neuron n at `layer` on `text` (as a user turn when chat=True)."""
+    def _push_entry(self, layer, n, dose, mode, rows):
+        """One neuron's push for the down_proj hook, per batch row: rows holds +1 (pushed), 0 (left alone) or -1
+        (pushed the other way). add doses are in units of the layer's median residual norm along the neuron's down
+        column; mul doses multiply the activation (left alone = x1, the other way = x -dose)."""
+        if n is None and mode != "mul":
+            raise ValueError("a whole-layer MLP push must be mode 'mul' (e.g. dose 0 to ablate)")
+        if mode == "mul":
+            vals = [dose if r > 0 else 1.0 if r == 0 else -dose for r in rows]
+        else:
+            unit = self.layer_resid_p50(layer) / float(self.down_col(layer, n).norm())
+            vals = [r * dose * unit for r in rows]
+        return (layer, n, mode, torch.tensor(vals, device=self.dev))
+
+    def read(self, layer, n, text, chat=True, pushes=None, heads=None):
+        """Per-token activation of neuron n at `layer` on `text` (as a user turn when chat=True), optionally with other
+        neurons pushed at the same time: pushes = [(layer, n, dose, mode)], the same units as steering (n None = the
+        layer's whole MLP, mul only), and attention heads scaled: heads = [(layer, head, scale)], head None = all heads,
+        scale 0 = ablated. Only earlier layers can move the read (a same-layer MLP push lands after the capture; a
+        same-layer head change lands before it)."""
         self.ensure_loaded()
         with self.lock:
             if chat:
@@ -206,17 +258,46 @@ class Runtime:
             else:
                 ids = self.tok(text).input_ids
             self._read = (layer, n)
+            self._push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
+            self._heads = list(heads) or None if heads else None
             try:
                 with torch.inference_mode():
                     self.lm(input_ids=torch.tensor([ids], device=self.dev), use_cache=False)
             finally:
                 self._read = None
+                self._push = None
+                self._heads = None
             act = self._seen.pop("act").tolist()
         units = []
         for text, idx in self.token_units(ids):
             vals = [act[i] for i in idx]
             units.append({"text": text, "act": max(vals, key=abs), "pieces": vals})
         return {"units": units}
+
+    def next_logprobs(self, text, chat=True, prefix="", pushes=None, heads=None):
+        """Log-probabilities of the next token after `text` (as a user turn when chat=True, so the next token opens the
+        reply) followed by `prefix`, as a [vocab] tensor. With pushes / heads (same units as read()) it also returns
+        the same distribution under that intervention: (base, intervened or None)."""
+        self.ensure_loaded()
+        ids = self.chat_ids(text) if chat else self.tok(text).input_ids
+        if prefix:
+            ids = ids + self.tok(prefix, add_special_tokens=False).input_ids
+
+        def run(push, hd):
+            with self.lock:
+                self._push, self._heads = push, hd
+                try:
+                    with torch.inference_mode():
+                        out = self.model(input_ids=torch.tensor([ids], device=self.dev), use_cache=False, logits_to_keep=1)
+                finally:
+                    self._push = self._heads = None
+                return torch.log_softmax(out.logits[0, -1].float(), -1).cpu()
+
+        base = run(None, None)
+        if not pushes and not heads:
+            return base, None
+        push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
+        return base, run(push, list(heads) if heads else None)
 
     def con_index(self):
         """Precomputed connections (build_connections.py), loaded once."""
@@ -286,12 +367,16 @@ class Runtime:
                 out[side] = [{"layer": int(ci[f"{side}_layer"][layer, n, i]), "n": int(ci[f"{side}_n"][layer, n, i]),
                               "z": round(float(z[i]), 2), "sign": int(ci[f"{side}_sign"][layer, n, i])}
                              for i in range(k) if z[i] > -1e4]
-            idx = self.lens_index()
+            idx = self.steer_index() or self.lens_index()  # linked neurons show their steer lens when there is one
             if lens_k and idx is not None:
                 v = self.vocab_strings()
+                lg = self.lens_index()
                 for c in out["down"] + out["up"]:
                     c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
                     c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
+                    if lg is not None and lg is not idx:  # the logit lens too, shown faintly under the steer lens
+                        c["logit"] = [v[t] for t in lg["up"][c["layer"], c["n"], :lens_k]]
+                        c["logit_neg"] = [v[t] for t in lg["down"][c["layer"], c["n"], :lens_k]]
             return out
         dkey = f"{layer}:{n}:{k}:{lens_k}"
         with self._db_lock:
@@ -329,7 +414,7 @@ class Runtime:
             for side in out:
                 out[side] = sorted(out[side], key=lambda c: -c["z"])[:k]
             every = out["down"] + out["up"]
-            idx = self.lens_index()
+            idx = self.steer_index() or self.lens_index()
             if every and lens_k and idx is not None and lens_k <= idx["up"].shape[-1]:
                 v = self.vocab_strings()
                 for c in every:

@@ -1,5 +1,8 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
+import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 
 // geometry: layers run left to right along x. Each layer is the residual stream passing through a token-mixer slab
 // (linear or full attention) and then the MLP, drawn as a vertical sheet of its neurons.
@@ -11,23 +14,31 @@ const PAL = {
   link: new THREE.Color(0.22, 0.78, 1.0),
   wire: 0x1c2a30, wireData: 0x3a5a66, slabEdge: 0x3c4a52, slabEdgeFull: 0x6a8592, head: 0x2f4a56, headFull: 0x5f8fa3,
 };
+// overall brightness of everything drawn in the map (points, lines, slabs); 1 = original
+const BRIGHT = Number(new URLSearchParams(location.search).get("bright")) || 2.5;
+// the boost lifts the structure (sheets, wires, idle points); data colours keep their hue
+for (const k in PAL) if (!["bg", "swept", "lo", "hi", "named"].includes(k)) PAL[k] = new THREE.Color(PAL[k]).multiplyScalar(BRIGHT);
 
 function glowPoints(sizePx, maxScale = 3) {
   return new THREE.RawShaderMaterial({
     uniforms: { size: { value: sizePx * Math.min(devicePixelRatio, 2) }, ref: { value: 1 }, maxScale: { value: maxScale },
-      focusX: { value: 0 }, fadeW: { value: 1 }, fadeAmt: { value: 0 }, camSide: { value: 1 } },
+      focusX: { value: 0 }, fadeW: { value: 1 }, fadeAmt: { value: 0 }, camSide: { value: 1 }, tdist: { value: 1 } },
     vertexShader: `precision highp float;
-      uniform mat4 modelViewMatrix, projectionMatrix; uniform float size, ref, maxScale, focusX, fadeW, fadeAmt, camSide;
+      uniform mat4 modelViewMatrix, projectionMatrix; uniform float size, ref, maxScale, focusX, fadeW, fadeAmt, camSide, tdist;
       attribute vec3 position; attribute vec3 color; varying vec3 vC;
       void main() { float d = (position.x - focusX) / fadeW;
         vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
-        // up close nothing overlaps, so each point brightens with proximity; neighbours never fade below a quarter
-        float near = clamp(sqrt(ref / -mv.z), 1.0, 3.5);
-        // layers between the camera and the focus go fully transparent as you zoom in (x-ray), the rest keep a floor
+        // up close nothing overlaps, so the scene brightens as the camera nears its focus; one factor for every point,
+        // so layers nearer the camera than the focus don't outshine it
+        float near = clamp(sqrt(ref / tdist), 1.0, 3.5);
+        // layers away from the focus fade as you zoom in (never below a quarter); layers between the camera and the
+        // focus fade further, to 40% up close (x-ray)
         float front = step(0.45, (position.x - focusX) * camSide / ${GAP.toFixed(3)});
-        float keep = mix(mix(1.0, exp(-d * d), fadeAmt * 0.75), 1.0 - fadeAmt, front);
-        vC = color * keep * near;
-        gl_PointSize = size * clamp(sqrt(ref / -mv.z), 0.6, maxScale); }`,
+        float keep = mix(1.0, exp(-d * d), fadeAmt * 0.75) * mix(1.0, 1.0 - 0.6 * fadeAmt, front);
+        // points nearer than the focus are drawn bigger; dim them by the extra size so they don't outshine it
+        float sc = clamp(sqrt(ref / -mv.z), 0.6, maxScale), sc0 = clamp(sqrt(ref / tdist), 0.6, maxScale);
+        vC = color * keep * near * min(1.0, sc0 / sc);
+        gl_PointSize = size * sc; }`,
     fragmentShader: `precision highp float; varying vec3 vC;
       void main() { float r = length(gl_PointCoord - 0.5); if (r > 0.5) discard;
         float edge = 1.0 - smoothstep(0.38, 0.5, r); gl_FragColor = vec4(vC * edge, 1.0); }`,
@@ -44,7 +55,8 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   const layerX = l => l * GAP;
   const X0 = ATTN_DX - 1.6, X1 = (L - 1) * GAP + MLP_DX + 1.4;
 
-  const insets = { left: 330, right: 0 };
+  const insets = { left: 410, right: 0 };
+  const TARGET_X = Number(new URLSearchParams(location.search).get("targetx")) || 0;
   let fitPerPx = null;
   const camera = new THREE.PerspectiveCamera(32, 1, 0.02, 2000);
   let homeDist = 60;
@@ -93,7 +105,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     seg(V(ax, 0, 0), V(ax, SHEET_Y0, 0)); seg(V(mx, 0, 0), V(mx, SHEET_Y0, 0));
     const full = arch.layer_types[l] === "full_attention", t = full ? 0.3 : 0.1;
     const slab = new THREE.Mesh(new THREE.BoxGeometry(t, SHEET * 0.92, SHEET * 0.92), new THREE.MeshBasicMaterial({
-      color: full ? 0x8fa6b2 : 0x6f8590, transparent: true, opacity: full ? 0.075 : 0.045, depthWrite: false }));
+      color: full ? 0x8fa6b2 : 0x6f8590, transparent: true, opacity: (full ? 0.075 : 0.045) * BRIGHT, depthWrite: false }));
     slab.position.set(ax, SHEET_Y0 + SHEET / 2, 0);
     slab.userData = { layer: l, full };
     scene.add(slab); slabs.push(slab);
@@ -139,6 +151,61 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
   conLines.frustumCulled = false; conLines.renderOrder = 2;
   scene.add(conLines);
+  // connection web of the selected neuron: upstream and downstream cones, coloured by link sign, fading per hop.
+  const qs = new URLSearchParams(location.search);
+  const WEB_ALPHA = Number(qs.get("webalpha")) || 0.5, WEB_DECAY = Number(qs.get("webdecay")) || 0.85;
+  // by the sign of the link: yellow when the writer pushes the reader up, magenta when it pushes it down
+  const WEB_UP = new THREE.Color(1.0, 0.82, 0.2), WEB_DOWN = new THREE.Color(1.0, 0.25, 0.85);
+  // fat lines (WebGL draws plain lines 1px wide), additive with the intensity folded into the colour, and outside the
+  // zoom fade, so the web stays bright up close
+  const webMat = new LineMaterial({ vertexColors: true, linewidth: Number(qs.get("webwidth")) || 2, transparent: true,
+    depthWrite: false, blending: THREE.AdditiveBlending });
+  const webLines = new LineSegments2(new LineSegmentsGeometry(), webMat);
+  webLines.frustumCulled = false; webLines.renderOrder = 1; webLines.visible = false;
+  scene.add(webLines);
+  const webPtGeo = new THREE.BufferGeometry(), webPts = new THREE.Points(webPtGeo, glowPoints(4.5, 2.5));
+  webPts.frustumCulled = false; webPts.renderOrder = 2; webPts.visible = false;
+  scene.add(webPts);
+  let webEdges = null;
+  const webFed = new Set(), webFeeds = new Set();  // neurons the drawn web reads into / out of (layer * N + n)
+  const DEAD = 0.08;  // brightness of lines the web doesn't continue through
+  const DIRECT = 0.6;  // the open neuron's direct links, relative to full brightness
+  function buildWeb() {
+    if (!webEdges || !webEdges.length) { webFed.clear(); webFeeds.clear(); webLines.visible = false; webPts.visible = false; return; }
+    const m = webEdges.length / 6, p = new Float32Array(m * 6), c = new Float32Array(m * 6);
+    let zhi = 1;
+    for (let i = 0; i < m; i++) zhi = Math.max(zhi, Math.abs(webEdges[i * 6 + 4]));
+    // a line is "through" when the web continues past both ends: its writer is read into by another drawn line (or is
+    // the open neuron) and its reader writes on into another (or is the open neuron); dead ends draw dimmer
+    const fed = webFed, feeds = webFeeds, nk = (l, n) => l * N + n;
+    fed.clear(); feeds.clear();
+    for (let i = 0; i < m; i++) { const e = webEdges.subarray(i * 6, i * 6 + 6); feeds.add(nk(e[0], e[1])); fed.add(nk(e[2], e[3])); }
+    const root = selected ? nk(selected.layer, selected.n) : -1;
+    const touched = new Map();
+    for (let i = 0; i < m; i++) {
+      const e = webEdges.subarray(i * 6, i * 6 + 6), a = neuronPos(e[0], e[1]), b = neuronPos(e[2], e[3]);
+      const k = e[4] > 0 ? WEB_UP : WEB_DOWN;
+      const s0 = nk(e[0], e[1]), d0 = nk(e[2], e[3]);
+      const through = (s0 === root || fed.has(s0)) && (d0 === root || feeds.has(d0));
+      const al = WEB_ALPHA * (0.6 + 0.4 * Math.abs(e[4]) / zhi) * Math.max(0.35, WEB_DECAY ** (Math.abs(e[5]) - 1)) * (through ? 1 : DEAD);
+      p.set([a.x, a.y, a.z, b.x, b.y, b.z], i * 6); c.set([k.r * al, k.g * al, k.b * al, k.r * al, k.g * al, k.b * al], i * 6);
+      // each touched neuron takes the colour of the hop that first reached it (edges arrive in hop order)
+      const key = e[5] > 0 ? e[2] * N + e[3] : e[0] * N + e[1];
+      if (!touched.has(key)) touched.set(key, [e[5] > 0 ? b : a, k]);
+    }
+    // dots too: a neuron the web runs through (read into and out of, or next to the open neuron) at full brightness
+    const tp = [], tc = [];
+    for (const [id, [v, k]] of touched) {
+      const f = (fed.has(id) || id === root) && (feeds.has(id) || id === root) ? 1 : DEAD * 3;
+      tp.push(v.x, v.y, v.z); tc.push(k.r * f, k.g * f, k.b * f);
+    }
+    webPtGeo.setAttribute("position", new THREE.Float32BufferAttribute(tp, 3));
+    webPtGeo.setAttribute("color", new THREE.Float32BufferAttribute(tc, 3));
+    webPts.visible = true;
+    webLines.geometry.dispose();
+    webLines.geometry = new LineSegmentsGeometry().setPositions(p).setColors(c);
+    webLines.visible = true;
+  }
   let selected = null, hovered = null, connections = [], hoverCon = null;
   const markGeo = new THREE.BufferGeometry();
   const markPts = new THREE.Points(markGeo, glowPoints(4, 2));
@@ -150,7 +217,9 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     const add = (l, n, color) => { const v = neuronPos(l, n); p.push(v.x, v.y, v.z); c.push(color.r, color.g, color.b); };
     const src = hoverCon ? hoverCon.src : selected, shown = hoverCon ? hoverCon.list : connections;
     const zmax = Math.max(...shown.map(k => k.z), 1);
-    for (const k of shown) add(k.layer, k.n, PAL.link.clone().multiplyScalar(0.35 + 0.65 * k.z / zmax));
+    // direct links coloured like the web: yellow feeds (pushes the reader up), magenta holds back
+    const linkCol = k => (k.sign > 0 ? WEB_UP : WEB_DOWN).clone();
+    for (const k of shown) add(k.layer, k.n, linkCol(k).multiplyScalar(0.35 + 0.65 * k.z / zmax));
     if (hovered) add(hovered.layer, hovered.n, PAL.named.clone().multiplyScalar(0.7));
     if (selected) add(selected.layer, selected.n, PAL.named);
     hiGeo.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
@@ -159,7 +228,10 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     if (src) {
       const a = neuronPos(src.layer, src.n);
       for (const k of shown) {
-        const b = neuronPos(k.layer, k.n), s = 0.2 + 0.8 * k.z / zmax, cl = PAL.link.clone().multiplyScalar(s);
+        // with the web on, a direct link stays bright only if the web goes on past its far end
+        const far = k.layer * N + k.n, on = !webEdges || !webEdges.length || hoverCon
+          || (k.side === "up" ? webFed.has(far) : webFeeds.has(far));
+        const b = neuronPos(k.layer, k.n), s = DIRECT * (0.2 + 0.8 * k.z / zmax) * (on ? 1 : DEAD), cl = linkCol(k).multiplyScalar(s);
         lp.push(a.x, a.y, a.z, b.x, b.y, b.z); lc.push(cl.r, cl.g, cl.b, cl.r, cl.g, cl.b);
       }
     }
@@ -168,21 +240,47 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     render();
   }
 
-  // layer labels, projected each frame
+  // layer labels: text drawn in each layer's plane, just above the top-right corner of its neuron sheet
+  const LABEL_H = Number(new URLSearchParams(location.search).get("labelsize")) || 0.2;
   const labels = [];
   for (let l = 0; l < L; l++) {
-    const s = document.createElement("span"); s.textContent = `L${l}`; labelsDiv.appendChild(s); labels.push(s);
-    s.onclick = () => enterLayer(l);
+    const cv = document.createElement("canvas"), ctx = cv.getContext("2d"), font = "600 64px ui-monospace, Menlo, monospace";
+    ctx.font = font; const tw = Math.ceil(ctx.measureText(`L${l}`).width) + 8;
+    cv.width = tw; cv.height = 80;
+    ctx.font = font; ctx.fillStyle = "#fff"; ctx.textBaseline = "middle"; ctx.fillText(`L${l}`, 4, 42);
+    const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 8;
+    const w = LABEL_H * tw / 80;
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide, color: 0xc8d4da });
+    mat.userData.base = 0.85;
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, LABEL_H), mat);
+    // the plane's +x runs toward -z after this turn, so the text reads toward the sheet's right edge seen from +x
+    m.rotation.y = Math.PI / 2;
+    m.position.set(layerX(l) + MLP_DX, SHEET_Y0 + SHEET + 0.08 + LABEL_H / 2, -SHEET / 2 + w / 2);
+    m.userData = { layer: l };
+    scene.add(m); labels.push(m);
   }
   const dataLayers = new Set();
-  function placeLabels() {
-    const w = canvas.clientWidth, h = canvas.clientHeight, v = new THREE.Vector3();
-    for (let l = 0; l < L; l++) {
-      v.set(layerX(l), -0.55, SHEET / 2).project(camera);
-      const s = labels[l];
-      s.style.left = `${(v.x + 1) / 2 * w}px`; s.style.top = `${(1 - v.y) / 2 * h}px`;
-      s.className = dataLayers.has(l) ? "data" : "";
+  let unitsLayer = null;
+
+  // annotations: short HTML labels pinned to neurons, re-projected every frame (Claude points things out with these)
+  let notes = [];
+  function placeNotes() {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    for (const a of notes) {
+      const v = neuronPos(a.layer, a.n).project(camera);
+      a.el.style.display = v.z > 1 || layerMode !== null && a.layer !== layerMode ? "none" : "";
+      a.el.style.left = `${(v.x + 1) / 2 * w}px`; a.el.style.top = `${(1 - v.y) / 2 * h}px`;
     }
+  }
+  function setNotes(items) {
+    for (const a of notes) a.el.remove();
+    notes = (items || []).map(it => {
+      // a zero-size anchor at the neuron: the ring is centred on it, the text sits to its right
+      const el = document.createElement("div"); el.className = "note";
+      const t = document.createElement("span"); t.textContent = it.text || `L${it.layer} N${it.n}`; el.appendChild(t);
+      labelsDiv.appendChild(el); return { layer: it.layer, n: it.n, el };
+    });
+    render();
   }
 
   let pending = false;
@@ -190,14 +288,15 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     if (pending) return; pending = true;
     requestAnimationFrame(() => {
       pending = false;
-      for (const m of [pointMat, hiMat, markPts.material]) m.uniforms.ref.value = homeDist;
+      for (const m of [pointMat, hiMat, markPts.material, webPts.material]) { m.uniforms.ref.value = homeDist; m.uniforms.tdist.value = curDist(); }
       applyFade();
-      renderer.render(scene, camera); placeLabels();
+      renderer.render(scene, camera); placeNotes();
     });
   }
   function resize() {
     const w = canvas.clientWidth, h = canvas.clientHeight;
     renderer.setSize(w, h, false);
+    webMat.resolution.set(w, h);
     const narrow = w <= 760, li = narrow ? 0 : insets.left, ri = narrow ? 0 : insets.right;
     const availW = Math.max(200, w - li - ri);
     camera.aspect = w / h;
@@ -210,8 +309,10 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       controls.update();
       fitPerPx = homeDist;
     }
-    // the orbit target sits centered in the visible gap between list and panel
-    camera.setViewOffset(w, h, (ri - li) / 2, 0, w, h);
+    // the orbit target (and vanishing point) sits in the middle of the visible gap between the list and the neuron
+    // panel, or at ?targetx= of the canvas width
+    const tx = TARGET_X ? w * TARGET_X : li + availW / 2;
+    camera.setViewOffset(w, h, w / 2 - tx, 0, w, h);
     camera.updateProjectionMatrix(); render();
   }
   new ResizeObserver(resize).observe(canvas);
@@ -235,6 +336,8 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       for (const h of hits) if (Math.floor(h.index / N) === front && (!best || h.distanceToRay < best.distanceToRay)) best = h;
       return { type: "neuron", layer: front, n: best.index % N };
     }
+    const lb = ray.intersectObjects(labels)[0];
+    if (lb) return { type: "block", layer: lb.object.userData.layer };
     const b = ray.intersectObjects(slabs)[0];
     if (b) return { type: "block", ...b.object.userData };
     return null;
@@ -293,7 +396,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       pointMat.uniforms.focusX.value = fx; pointMat.uniforms.fadeW.value = 0.05; pointMat.uniforms.fadeAmt.value = 1;
       fade.fx = fx; fade.fw = 0.05; fade.amt = 1;
       for (const slab of slabs) { slab.material.opacity = 0; slab.userData.edges.material.opacity = 0; }
-      for (let l = 0; l < L; l++) labels[l].style.opacity = 0;
+      for (let l = 0; l < L; l++) labels[l].material.opacity = 0;
       for (const m of fadeLines) m.opacity = 0;
       dataOutline.visible = false;
       return;
@@ -303,7 +406,15 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     const dist = camera.position.distanceTo(controls.target);
     const far = Math.log(homeDist * 0.7), near = Math.log(homeDist * 0.07);
     const amt = THREE.MathUtils.smoothstep(THREE.MathUtils.clamp((far - Math.log(dist)) / (far - near), 0, 1), 0, 1);
-    const fx = controls.target.x, fw = GAP * (0.85 + 2.5 * (1 - amt));
+    // the focus is the layer whose sheet centre lands closest to the middle of the view on screen
+    const tv = controls.target.clone().project(camera), pv = new THREE.Vector3();
+    let fx = controls.target.x, best = Infinity;
+    for (let l = 0; l < L; l++) {
+      pv.set(layerX(l) + MLP_DX, SHEET_Y0 + SHEET / 2, 0).project(camera);
+      const dd = Math.hypot((pv.x - tv.x) * camera.aspect, pv.y - tv.y);
+      if (pv.z < 1 && dd < best) { best = dd; fx = layerX(l) + MLP_DX; }
+    }
+    const fw = GAP * (0.85 + 2.5 * (1 - amt));
     const side = Math.sign(camera.position.x - fx) || 1;
     pointMat.uniforms.focusX.value = fx; pointMat.uniforms.fadeW.value = fw; pointMat.uniforms.fadeAmt.value = amt;
     pointMat.uniforms.camSide.value = side;
@@ -314,7 +425,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     }
     for (let l = 0; l < L; l++) {
       const d = (layerX(l) + MLP_DX - fx) / fw;
-      labels[l].style.opacity = 1 - amt * (1 - Math.exp(-d * d));
+      labels[l].material.opacity = labels[l].material.userData.base * (1 - 0.5 * amt * (1 - Math.exp(-d * d)));  // other layers keep half
     }
     for (const m of fadeLines) m.opacity = m.userData.base * (1 - 0.9 * amt);
   }
@@ -350,8 +461,12 @@ export function createMap(canvas, labelsDiv, arch, cb) {
 
   return {
     neuronPos,
+    // the swept neurons' colours show on one layer at a time (the current one); the others go back to idle
     setUnits(layer, units) {
+      if (unitsLayer !== null && unitsLayer !== layer) for (let n = 0; n < N; n++) PAL.idle.toArray(col, (unitsLayer * N + n) * 3);
+      unitsLayer = layer;
       dataLayers.add(layer);
+      labels[layer].material.userData.base = 1; labels[layer].material.color.set(0xffffff);
       const zs = units.filter(u => u.kind === "neuron").map(u => u.z);
       const rnd = units.filter(u => u.kind === "random").map(u => u.z);
       const floor = rnd.length ? Math.max(...rnd) : Math.min(...zs), top = Math.max(...zs, floor + 1e-6);
@@ -376,10 +491,13 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       selected = layer == null ? null : { layer, n };
       connections = [];
       refreshHighlights();
-
+      if (!fly || layer == null || layerMode !== null) return;
+      // off screen (or behind the camera): fly to it, never zooming out from where the user is
+      const v = neuronPos(layer, n).project(camera);
+      if (v.z > 1 || Math.abs(v.x) > 0.9 || Math.abs(v.y) > 0.9) flyTo(neuronPos(layer, n), Math.min(curDist(), homeDist * 0.35));
     },
     setConnections(con) {
-      connections = [...con.down, ...con.up];
+      connections = [...con.down.map(c => ({ ...c, side: "down" })), ...con.up.map(c => ({ ...c, side: "up" }))];
       refreshHighlights();
     },
     setHoverConnections(src, con) {
@@ -396,9 +514,16 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       }
       geo.attributes.position.needsUpdate = true;
       geo.computeBoundingSphere();
+      buildWeb();
       refreshHighlights();
     },
-    enterLayer, exitLayer,
+    // edges: Int16Array, 6 per link (src layer, src n, dst layer, dst n, 10 * z * sign, hop), or null to hide
+    setWeb(edges) { webEdges = edges; buildWeb(); refreshHighlights(); },
+    enterLayer, exitLayer, viewLayer, setNotes,
+    // centre the view on a neuron, keeping the zoom unless it is wider than a few layers' worth
+    focusNeuron(layer, n) { if (layerMode === null) flyTo(neuronPos(layer, n), Math.min(curDist(), homeDist * 0.35)); },
+    // fly close to one neuron, keeping the current viewing direction
+    flyToNeuron(layer, n, closeness = 0.22) { flyTo(neuronPos(layer, n), homeDist * closeness); },
     get layerMode() { return layerMode; },
     home() { flyTo(home.target, homeDist); },
     setMarks(marks) {
@@ -414,7 +539,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     },
     setInsets(left, right) { insets.left = left; insets.right = right; resize(); },
     hover(layer, n) { hovered = layer == null ? null : { layer, n }; refreshHighlights(); },
-    debug() { return { cam: camera.position.toArray().map(v => +v.toFixed(2)), tgt: controls.target.toArray().map(v => +v.toFixed(2)), selected, hovered, n: connections.length, hover: hoverCon ? hoverCon.list.length : 0, dist: curDist(), homeDist, w: canvas.clientWidth, h: canvas.clientHeight, insets }; },
+    debug() { const tv = controls.target.clone().project(camera); return { tgtScreenX: +((tv.x + 1) / 2).toFixed(3), cam: camera.position.toArray().map(v => +v.toFixed(2)), tgt: controls.target.toArray().map(v => +v.toFixed(2)), selected, hovered, n: connections.length, hover: hoverCon ? hoverCon.list.length : 0, dist: curDist(), homeDist, w: canvas.clientWidth, h: canvas.clientHeight, insets }; },
     render,
   };
 }

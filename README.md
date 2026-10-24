@@ -20,6 +20,12 @@ steered chat, lens, connections and live inference over your own text.
 - **neuron**: steered rollouts per prompt and dose, a three-column multi-turn steered chat (−, 0, +), lens and
   connections, and a name.
 - **embeddings**: UMAP of a layer's rollouts, coloured by neuron, prompt, dose or kind.
+- **Claude** (fourth neuron-panel tab, or the right-edge handle): a chat running the `claude` CLI (installed and
+  logged in) with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
+  live model (steering, activations, next-token logprobs, ablations), moves the map, list and highlights, and has file
+  tools and a shell in your home folder. Its prompt is `explorer/agent_prompt.md` plus `explorer/agent_methodology.md`, and
+  `explorer/agent_prompt.local.md` when present (untracked, for your own additions);
+  `EXPLORER_CLAUDE_MODEL` picks the model. The server answers only pages and tools on this machine.
 
 ## Sweep
 
