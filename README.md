@@ -3,6 +3,8 @@
 Steering-first neuron explorer for Qwen3.5-4B. Every MLP neuron in a layer is pushed up and down on a few prompts, every
 rollout is kept, and the explorer lays the results out over a 3D view of the model.
 
+![neuron explorer](explorer.png)
+
 ## Explorer
 
     uv sync
