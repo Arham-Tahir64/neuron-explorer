@@ -1,12 +1,15 @@
-"""Stdio MCP server that gives the explorer's Claude chat its tools: read any neuron data through the explorer's HTTP API,
+"""Stdio MCP server that gives the explorer's CLI assistants their tools: read neuron data through the explorer's HTTP API,
 run the live model (steered rollouts, activations) when it is loaded, and drive the map (select, highlight) in the browser that started the chat. Standard library only; started by
-`claude -p --mcp-config ...` from server.py with EXPLORER_URL and EXPLORER_CHAT set.
+the Claude or Codex CLI from server.py with EXPLORER_URL and EXPLORER_CHAT set.
 """
 import json
 import os
 import sys
 import urllib.parse
 import urllib.request
+
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
 
 URL = os.environ.get("EXPLORER_URL", "http://127.0.0.1:8791")
 CHAT = os.environ.get("EXPLORER_CHAT", "")

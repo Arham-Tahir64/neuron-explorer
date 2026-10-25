@@ -4,12 +4,15 @@
 """
 import asyncio
 import builtins
+from contextlib import aclosing
 import glob
 import json
 import os
+from pathlib import Path
 import sys
 import threading
 
+import anyio
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request
@@ -22,6 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
 from runtime import NO_MODEL, Runtime  # noqa: E402
+from codex_adapter import CodexAdapter, cli_command  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
 NAMES = os.path.join(ROOT, "explorer", "names.json")
@@ -36,7 +40,7 @@ app = FastAPI()
 
 
 # only this machine's own pages and tools: a page on another site (or a DNS name rebound to 127.0.0.1) can't reach
-# the API, which runs the model and a Claude agent with a shell
+# the API, which runs the model and a CLI agent with a shell
 LOCAL_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}"}
 
 
@@ -577,11 +581,11 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
             "up": {"neurons": len(up), "fed_by": pool(up, 1), "held_by": pool(up, -1)}}
 
 
-# ---------- Claude: autointerp and chat ----------
-# Each chat is a `claude -p` session resumed turn by turn. Its tools come from agent_mcp.py, which reads through the
+# ---------- CLI assistants: autointerp and chat ----------
+# Each chat is a Claude or Codex CLI session resumed turn by turn. Tools come from agent_mcp.py, which reads through the
 # endpoints below and sends map actions back through /api/agent/ui into the chat's event stream.
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
-AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # claude's cwd, so no project settings or CLAUDE.md apply
+AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # CLI working files and session metadata
 _chats = {}
 _act = {}
 
@@ -876,21 +880,29 @@ AGENT_LOCAL = os.path.join(ROOT, "explorer", "agent_prompt.local.md")  # this ma
 def agent_prompt_file():
     """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
     this checkout's path, written beside the chat's working files."""
-    text = open(AGENT_PROMPT).read()
+    text = Path(AGENT_PROMPT).read_text(encoding="utf-8")
     for extra in (AGENT_METHOD, AGENT_LOCAL):
         if os.path.exists(extra):
-            text = text.rstrip() + "\n\n" + open(extra).read()
-    text = text.replace("{ROOT}", ROOT)
+            text = text.rstrip() + "\n\n" + Path(extra).read_text(encoding="utf-8")
+    text = text.replace("{ROOT}", ROOT).replace("{PYTHON}", sys.executable).replace("{PORT}", str(PORT))
     out = os.path.join(AGENT_DIR, "system_prompt.md")
-    if not os.path.exists(out) or open(out).read() != text:
-        with open(out, "w") as f:
-            f.write(text)
+    if not os.path.exists(out) or Path(out).read_text(encoding="utf-8") != text:
+        Path(out).write_text(text, encoding="utf-8")
     return out
 
 
 async def _stop_turn(proc):
     import signal
-    if proc is None or proc.returncode is not None:
+    if proc is None:
+        return
+    if os.name == "nt":
+        if proc.returncode is None:
+            import subprocess
+            killer = await asyncio.create_subprocess_exec("taskkill", "/PID", str(proc.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            await killer.wait()
+            await proc.wait()
         return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
@@ -924,13 +936,31 @@ def _user_text(m):
 
 @app.post("/api/agent/rewind")
 async def agent_rewind(req: Request):
-    """Cut a chat's claude session back to just before the last message the person sent that ends with `text`
-    (everything after it goes too: the reply, a refusal, CLI notes). The cut session is backed up beside it first.
-    No match (already cut) is not an error."""
-    import shutil
-    import time
+    """Rewind Claude on disk or rebuild Codex from the retained conversation. No match is not an error."""
     b = await req.json()
     sid, text = b["chat"], (b.get("text") or "").strip()
+    provider = b.get("provider", "claude")
+    if provider not in ("claude", "codex"):
+        return JSONResponse({"error": "unknown assistant provider"}, status_code=400)
+    c = _chats.get(sid)
+    if c and c.get("provider", "claude") != provider:
+        return JSONResponse({"error": "chat belongs to another provider"}, status_code=409)
+    if c:
+        await _stop_turn(c.get("proc"))
+    if c:
+        async with c.setdefault("lock", asyncio.Lock()):
+            return _rewind_session(sid, text, provider)
+    return _rewind_session(sid, text, provider)
+
+
+def _rewind_session(sid, text, provider):
+    import shutil
+    import time
+    if provider == "codex":
+        try:
+            return {"ok": True, "cut": CodexAdapter(AGENT_DIR, sid).rewind(text)}
+        except ValueError:
+            return JSONResponse({"error": "invalid chat id"}, status_code=400)
     path = _session_file(sid)
     if not path:
         return {"ok": True, "cut": False}
@@ -958,49 +988,76 @@ async def agent_rewind(req: Request):
 
 @app.post("/api/agent/chat")
 async def agent_chat(req: Request):
-    """One turn. Body: {chat?, message, layer?, n?, attachments?: [upload ids]}. Streams NDJSON events: chat, text,
+    """One turn. Body: {provider?: claude|codex, chat?, message, layer?, n?, attachments?: [upload ids]}. NDJSON: chat, text,
     tool, tool_result, ui, done, error."""
     import uuid
     b = await req.json()
-    # the chat id is the claude session id, so a chat the browser kept survives server restarts (it resumes)
-    cid = b.get("chat") or str(uuid.uuid4())
-    c = _chats.setdefault(cid, {"session": cid})
-    c["queue"] = q = asyncio.Queue()
+    provider = b.get("provider", "claude")
+    if provider not in ("claude", "codex"):
+        return JSONResponse({"error": "unknown assistant provider"}, status_code=400)
+    try:
+        cid = str(uuid.UUID(b["chat"])) if b.get("chat") else str(uuid.uuid4())
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse({"error": "invalid chat id"}, status_code=400)
+    c = _chats.setdefault(cid, {"session": cid, "provider": provider})
+    if c.get("provider", "claude") != provider:
+        return JSONResponse({"error": "chat belongs to another provider"}, status_code=409)
+    q = asyncio.Queue()
+    lock = c.setdefault("lock", asyncio.Lock())
     msg = b["message"]
     if b.get("layer") is not None:
         msg = f"[The person has L{int(b['layer'])} N{int(b['n'])} open in the explorer.]\n\n{msg}"
     os.makedirs(AGENT_DIR, exist_ok=True)
     mcp = {"mcpServers": {"explorer": {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
                                        "env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": cid}}}}
-    content = [{"type": "text", "text": msg}] + [blk for a in b.get("attachments") or [] if (blk := attachment_block(a))]
-    cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+    files = []
+    for fid in b.get("attachments") or []:
+        fid = os.path.basename(str(fid))
+        meta_path = os.path.join(UPLOADS, f"{fid}.json")
+        if os.path.exists(meta_path):
+            meta = json.load(open(meta_path, encoding="utf-8"))
+            files.append({**meta, "path": os.path.join(UPLOADS, f"{fid}-{meta['name']}")})
+    content = [{"type": "text", "text": msg}] + ([blk for a in b.get("attachments") or [] if (blk := attachment_block(a))]
+                                                if provider == "claude" else [])
+    claude_args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
            "--system-prompt-file", agent_prompt_file(), "--mcp-config", json.dumps(mcp), "--strict-mcp-config",
            # file tools and a shell, so it can run scripts against this server (e.g. score a file it shouldn't read)
            "--tools", *FILE_TOOLS, "--allowedTools", "mcp__explorer", *FILE_TOOLS,
            "--add-dir", os.path.expanduser("~"), "--setting-sources", "project"]
     if os.environ.get("EXPLORER_CLAUDE_MODEL"):
-        cmd += ["--model", os.environ["EXPLORER_CLAUDE_MODEL"]]
+        claude_args += ["--model", os.environ["EXPLORER_CLAUDE_MODEL"]]
 
-    async def events():
-        # a turn that was interrupted may still be exiting; it holds the session until it does
-        await _stop_turn(c.get("proc"))
-        # resume once the session exists on disk (any earlier turn, finished or interrupted, creates it)
-        sess = ["--resume", c["session"]] if _session_file(c["session"]) else ["--session-id", c["session"]]
-        # its own process group, so stopping a turn also stops what it started (MCP server, shell scripts)
-        proc = c["proc"] = await asyncio.create_subprocess_exec(*cmd, *sess, cwd=AGENT_DIR, stdin=asyncio.subprocess.PIPE,
-                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                                                    limit=1 << 24, start_new_session=True)
-        proc.stdin.write((json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode())
-        await proc.stdin.drain()
-        proc.stdin.close()
-
-        async def pump():
-            async for line in proc.stdout:
-                q.put_nowait(("claude", line))
-            q.put_nowait(("end", (await proc.stderr.read()).decode(errors="replace")))
-        task = asyncio.create_task(pump())
-        yield json.dumps({"t": "chat", "chat": cid}) + "\n"
+    async def turn_events():
+        c["queue"] = q
+        adapter, proc, task, stderr_task = None, None, None, None
+        yield json.dumps({"t": "chat", "chat": cid, "provider": provider}) + "\n"
         try:
+            if provider == "codex":
+                adapter = CodexAdapter(AGENT_DIR, cid)
+                cmd, payload = adapter.prepare(ROOT, AGENT_DIR, cid, PORT, agent_prompt_file(), msg, b["message"], files)
+            else:
+                sess = ["--resume", c["session"]] if _session_file(c["session"]) else ["--session-id", c["session"]]
+                cmd = cli_command("claude") + claude_args + sess
+                payload = (json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode()
+            # An independent process tree lets stop also terminate MCP and shell children.
+            options = {"start_new_session": True}
+            if os.name == "nt":
+                import subprocess
+                options = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+            proc = c["proc"] = await asyncio.create_subprocess_exec(*cmd, cwd=AGENT_DIR, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=1 << 24, **options)
+            if adapter:
+                adapter.started()
+            # Drain both pipes concurrently; verbose stderr must not block JSONL stdout.
+            stderr_task = asyncio.create_task(proc.stderr.read())
+            async def pump():
+                async for line in proc.stdout:
+                    q.put_nowait(("cli", line))
+                q.put_nowait(("end", (await stderr_task).decode(errors="replace")))
+            task = asyncio.create_task(pump())
+            proc.stdin.write(payload)
+            await proc.stdin.drain()
+            proc.stdin.close()
             while True:
                 kind, item = await q.get()
                 if kind == "ui":
@@ -1008,11 +1065,15 @@ async def agent_chat(req: Request):
                     continue
                 if kind == "end":
                     if await proc.wait() != 0:
-                        yield json.dumps({"t": "error", "error": item.strip()[-600:] or f"claude exited {proc.returncode}"}) + "\n"
+                        yield json.dumps({"t": "error", "error": item.strip()[-600:] or f"{provider} exited {proc.returncode}"}) + "\n"
                     break
                 try:
                     m = json.loads(item)
                 except ValueError:
+                    continue
+                if adapter:
+                    for event in adapter.events(m):
+                        yield json.dumps(event) + "\n"
                     continue
                 if m.get("type") == "stream_event":
                     e = m["event"]
@@ -1036,13 +1097,25 @@ async def agent_chat(req: Request):
                     if m.get("is_error"):
                         yield json.dumps({"t": "error", "error": str(m.get("result"))[:600]}) + "\n"
                     yield json.dumps({"t": "done", "cost": m.get("total_cost_usd")}) + "\n"
+        except (OSError, ValueError) as error:
+            yield json.dumps({"t": "error", "error": f"{provider} CLI: {error}"}) + "\n"
         finally:
-            task.cancel()
-            import signal
-            try:
-                os.killpg(proc.pid, signal.SIGTERM if proc.returncode is None else signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            if task:
+                task.cancel()
+            if stderr_task:
+                stderr_task.cancel()
+            # StreamingResponse cancels its task when the browser stops; still reap the CLI tree.
+            with anyio.CancelScope(shield=True):
+                await _stop_turn(proc)
+                if adapter and adapter.turn in adapter.state["turns"]:
+                    adapter.save()
+
+    async def events():
+        await _stop_turn(c.get("proc"))
+        async with lock:
+            async with aclosing(turn_events()) as turns:
+                async for event in turns:
+                    yield event
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
 

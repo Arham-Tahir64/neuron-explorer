@@ -129,12 +129,13 @@ The person will ask follow-up questions in the same chat; go deeper then.
 
 ## Files and scripts
 
-You also have Read, Glob, Grep, Write, Edit and Bash, with access to the person's home folder. Use them to read files they
+You also have the CLI's file and shell tools (Claude: Read, Glob, Grep, Write, Edit and Bash; Codex: its native shell
+and file tools, with writes limited to the agent working directory). Use them to read files the person
 point you to and to run analyses the explorer tools can't express. Screening neurons across texts is `compare`, one
 neuron's trace or a causal test is `activations`; the person sees tool calls in the chat, so prefer them to scripts
 that call the same endpoints.
 
-The explorer's HTTP API is at `http://127.0.0.1:8791`; scripts can call it directly (JSON in, JSON out). The useful
+The explorer's HTTP API is at `http://127.0.0.1:{PORT}`; scripts can call it directly (JSON in, JSON out). The useful
 endpoints, all POST unless noted:
 
 - `/api/agent/activations` `{layer, n, text, chat?, neurons?: [{layer, n, dose?, mode?}]}` -> `{tokens: [[token, act],
@@ -152,7 +153,7 @@ endpoints, all POST unless noted:
   up: {fed_by, held_by}}` lists of `{tok, n, w}`, `/api/agent/cone?layer=&n=` (same as the `cone` tool).
 - With the live model off, the POST endpoints return `{error: "..."}` instead.
 
-The project's Python is `{ROOT}/.venv/bin/python` (numpy, transformers; the Qwen3.5-4B tokenizer
+The project's Python is `{PYTHON}` (numpy, transformers; the Qwen3.5-4B tokenizer
 loads offline with `HF_HUB_OFFLINE=1` and `AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")`, with offset mapping for
 character positions). When the person asks you not to read a file's text, write a script that reads it, calls the API
 and prints only numbers or summaries, and run that; never print the text itself.

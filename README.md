@@ -22,12 +22,44 @@ steered chat, lens, connections and live inference over your own text.
 - **neuron**: steered rollouts per prompt and dose, a three-column multi-turn steered chat (−, 0, +), lens and
   connections, and a name.
 - **embeddings**: UMAP of a layer's rollouts, coloured by neuron, prompt, dose or kind.
-- **Claude** (fourth neuron-panel tab, or the right-edge handle): a chat running the `claude` CLI (installed and
-  logged in) with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
+- **CLI assistant** (fourth neuron-panel tab, or the right-edge handle): choose **Claude** or **Codex** in the
+  **CLI assistant** selector. Install and sign in to the selected CLI (`claude` or `codex`) first. Each uses
+  the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
   live model (steering, activations, next-token logprobs, ablations), moves the map, list and highlights, and has file
-  tools and a shell in your home folder. Its prompt is `explorer/agent_prompt.md` plus `explorer/agent_methodology.md`, and
+  tools and a shell. Its prompt is `explorer/agent_prompt.md` plus `explorer/agent_methodology.md`, and
   `explorer/agent_prompt.local.md` when present (untracked, for your own additions);
-  `EXPLORER_CLAUDE_MODEL` picks the model. The server answers only pages and tools on this machine.
+  `EXPLORER_CLAUDE_MODEL` or `EXPLORER_CODEX_MODEL` picks the corresponding model; otherwise the CLI's default applies.
+  The server answers only pages and tools on this machine.
+
+### Codex CLI
+
+Install [Codex CLI](https://developers.openai.com/codex/cli), run `codex login`, then start the explorer and
+select **Codex**. No API key or Python SDK is required when using your saved CLI login. The adapter uses
+[`codex exec --json` and session resume](https://developers.openai.com/codex/noninteractive), and configures the
+explorer MCP server for each invocation without changing your Codex configuration.
+
+On Windows, the adapter also looks for Codex in its standard per-user installation folders when it is absent from
+the server's `PATH`. You can select a specific executable before starting the server:
+
+```powershell
+$env:EXPLORER_CODEX_BIN = "C:\path\to\codex.exe"
+python -m uv run python explorer/server.py
+```
+
+Use the executable's full path, without extra command arguments. `EXPLORER_CLAUDE_BIN` provides the same override
+for Claude. Restart the server after changing either setting.
+
+Claude and Codex keep separate conversations in the browser. Codex thread IDs and retained messages are saved under
+`explorer/cache/agent/codex/`, so replies can continue after a server restart. **Edit** and **reroll** start a fresh
+Codex thread with the earlier messages and replies as context; discarded turns and their tool traces are excluded.
+Images are passed through `--image`; other uploads, including PDFs, are provided as local paths for the CLI's tools
+(reading PDFs requires a suitable local reader). Codex shell writes stay in `explorer/cache/agent/` using the
+`workspace-write` sandbox; network access is enabled so it can reach the explorer's local HTTP tools. Interactive
+approval requests are disabled, so operations outside that sandbox can fail and be reported in the chat.
+
+Adapter regression checks (no model download or CLI login needed):
+
+    uv run python -m unittest discover -s tests -v
 
 ## Sweep
 

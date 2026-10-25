@@ -11,7 +11,7 @@ addEventListener("unhandledrejection", e => { const el = document.querySelector(
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
-let agentSelecting = false, agentMarked = false;  // Claude's selections and marks (see agentUi); declared early, openNeuron reads them on load
+let agentSelecting = false, agentMarked = false;  // The assistant's selections and marks (see agentUi); declared early, openNeuron reads them on load
 const state = { layer: null, units: {}, unitMap: {}, focus: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
@@ -192,7 +192,7 @@ function showLeft(t) {
   $(`#ltabs button[data-lt="${t}"]`).classList.remove("fresh");
   syncLeftMap();
 }
-// a tab whose contents changed while hidden (Claude ran text, or searched) gets a dot until opened
+// a tab whose contents changed while hidden (the assistant ran text, or searched) gets a dot until opened
 function markLeftFresh(t) { if (t !== leftTab) $(`#ltabs button[data-lt="${t}"]`).classList.add("fresh"); }
 // the map shows what the open tab shows: lens hits and the open neuron's web on net, what fired on run
 function syncLeftMap() {
@@ -418,23 +418,23 @@ function setFocusCollapsed(c) {
   focusEl.classList.toggle("collapsed", c);
   syncEdge(); updateInsets();
 }
-// the right edge handle: brings back a collapsed panel, or opens Claude when no panel is up
+// the right edge handle: brings back a collapsed panel, or opens the assistant when no panel is up
 function syncEdge() {
   const on = focusEl.classList.contains("on"), col = focusEl.classList.contains("collapsed"), f = state.focus;
   const t = $("#focus-tab");
   t.classList.toggle("on", !on || col);
-  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ claude";
+  t.textContent = on && col && f ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : `‹ ${$("#a-provider").selectedOptions[0].textContent.toLowerCase()}`;
 }
 $("#list-hide").onclick = () => setListHidden(true);
 $("#list-tab").onclick = () => setListHidden(false);
 $("#f-collapse").onclick = () => setFocusCollapsed(true);
-$("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusCollapsed(false) : openClaude();
+$("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusCollapsed(false) : openAgent();
 
 // ---------- focus panel ----------
 const focusEl = $("#focus");
-// closing the neuron keeps the panel up when Claude is the open tab
+// closing the neuron keeps the panel up when the assistant is the open tab
 $("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; $("#list").classList.remove("has-focus");
-  if (curTab() === "claude") syncTabs(); else focusEl.classList.remove("on");
+  if (curTab() === "agent") syncTabs(); else focusEl.classList.remove("on");
   setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
 const tabBtn = t => $(`#tabs button[data-tab="${t}"]`);
@@ -442,21 +442,21 @@ const curTab = () => $("#tabs button.on")?.dataset.tab;
 function setTab(t) {
   document.querySelectorAll("#tabs button[data-tab]").forEach(x => x.classList.toggle("on", x.dataset.tab === t));
   document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.id === `tab-${t}`));
-  focusEl.classList.toggle("on-claude", t === "claude");
+  focusEl.classList.toggle("on-agent", t === "agent");
   tabBtn(t).classList.remove("fresh");
-  if (t === "claude") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; }
+  if (t === "agent") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; }
 }
 // a tab that changed while another was showing gets a dot until opened
 function markFresh(t) { if (curTab() !== t) tabBtn(t).classList.add("fresh"); }
-// neuron tabs show while a neuron is open (Chat for real neurons only); Claude always
+// neuron tabs show while a neuron is open (Chat for real neurons only); the assistant always
 function syncTabs() {
   const f = state.focus;
   for (const t of ["examples", "details"]) tabBtn(t).style.display = f ? "" : "none";
   tabBtn("chat").style.display = f && f.kind === "neuron" ? "" : "none";
-  if (tabBtn(curTab()).style.display === "none") setTab(f ? "examples" : "claude");
+  if (tabBtn(curTab()).style.display === "none") setTab(f ? "examples" : "agent");
 }
-function openClaude() {
-  focusEl.classList.add("on"); syncTabs(); setTab("claude"); setFocusCollapsed(false); $("#a-input").focus();
+function openAgent() {
+  focusEl.classList.add("on"); syncTabs(); setTab("agent"); setFocusCollapsed(false); $("#a-input").focus();
 }
 
 async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
@@ -736,9 +736,9 @@ const first = have.includes(saved) ? saved : have.includes(22) ? 22 : (have[0] ?
 await setLayer(first);
 if (location.hash) fromHash();
 
-// ---------- claude: the Claude tab, one claude -p session per conversation ----------
-const agent = { chat: null, ctl: null };
-const agentEl = $("#tab-claude");
+// ---------- CLI assistants: separate Claude and Codex conversations ----------
+const agent = { chat: null, ctl: null, provider: "claude" };
+const agentEl = $("#tab-agent");
 function mdInline(t) {
   return esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
     .replace(/\bL(\d{1,2})[ \/]N(\d{1,4})\b/g, (m, l, n) => `<a class="nref" data-l="${l}" data-n="${n}">${m}</a>`);
@@ -756,14 +756,15 @@ function md(src) {
   return out.join("");
 }
 const EMPTY = `<div class="a-empty dim">Ask anything about the model, or open a neuron and press <b>explain</b>.</div>`;
-// the conversation persists in this browser: chat id (= claude session, resumed server side) and the rendered thread
+// Each provider keeps its own persisted chat ID and rendered conversation in this browser.
 const AGENT_KEY = "explorer.agent";
+const agentKey = () => agent.provider === "claude" ? AGENT_KEY : `${AGENT_KEY}.${agent.provider}`;
 function saveAgent() {
-  try { localStorage.setItem(AGENT_KEY, JSON.stringify({ chat: agent.chat, html: $("#a-thread").innerHTML })); } catch {}
+  try { localStorage.setItem(agentKey(), JSON.stringify({ chat: agent.chat, html: $("#a-thread").innerHTML })); } catch {}
 }
 function loadAgent() {
   try {
-    const v = JSON.parse(localStorage.getItem(AGENT_KEY) || "null"); if (!v) return;
+    const v = JSON.parse(localStorage.getItem(agentKey()) || "null"); if (!v) return;
     agent.chat = v.chat; $("#a-thread").innerHTML = v.html || EMPTY;
     $("#a-thread").querySelectorAll("#a-usename, .a-msg.queued, .a-busy").forEach(b => b.remove());
     $("#a-thread").scrollTop = $("#a-thread").scrollHeight;
@@ -782,14 +783,15 @@ $("#a-actions").addEventListener("click", e => {
 });
 function resetAgent() {
   if (agent.ctl) agent.ctl.abort();
+  agent.ctl = null; agent.queue = []; setSendMode(false);
   agent.chat = null; $("#a-thread").innerHTML = EMPTY;
   saveAgent();
 }
 agentEl.addEventListener("click", e => {
   const a = e.target.closest("a.nref"); if (a) goToNeuron(+a.dataset.l, +a.dataset.n);
 });
-// what Claude does to the screen (see agent_mcp.py)
-// Claude's labels and highlights last until its next reply, or until the person opens a neuron themselves
+// what the assistant does to the screen (see agent_mcp.py)
+// The assistant's labels and highlights last until its next reply, or until the person opens a neuron themselves
 function clearAgentMarks() {
   map.setNotes([]);
   if (agentMarked) { agentMarked = false; syncLeftMap(); }
@@ -813,7 +815,7 @@ async function agentUi(e) {
     if (e.mode === "home") map.home();
     else if (e.mode === "layer") map.viewLayer(e.layer);
     else if (e.mode === "neuron") map.flyToNeuron(e.layer, e.n, e.closeness || 0.22);
-  } else if (e.action === "tab") { if (state.focus && tabBtn(e.tab)) { if (curTab() === "claude") markFresh(e.tab); else setTab(e.tab); } }
+  } else if (e.action === "tab") { if (state.focus && tabBtn(e.tab)) { if (curTab() === "agent") markFresh(e.tab); else setTab(e.tab); } }
   else if (e.action === "search") {
     if (state.qMode !== "lens") $('#q-mode button[data-q="lens"]').click();
     $("#lens-q").value = e.query; $("#lens-q").dispatchEvent(new Event("input"));
@@ -862,8 +864,9 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
   const stick = () => { th.scrollTop = th.scrollHeight; };
   setSendMode(true);
   try {
-    const body = { chat: agent.chat, message, attachments: atts.map(a => a.id), ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : {}) };
+    const body = { provider: agent.provider, chat: agent.chat, message, attachments: atts.map(a => a.id), ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : {}) };
     const r = await fetch("/api/agent/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctl.signal });
+    if (!r.ok) throw new Error(`${r.status}: ${(await r.text()).slice(0, 300)}`);
     const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
     for (;;) {
       const { value, done } = await rd.read(); if (done) break;
@@ -871,6 +874,7 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line) continue;
+        if (agent.ctl !== ctl) return { reply, box };
         const e = JSON.parse(line);
         if (e.t === "chat") agent.chat = e.chat;
         else if (e.t === "text") {
@@ -896,10 +900,10 @@ async function agentTurn(message, shown, shownCls = "user", atts = []) {
   } finally {
     busy.remove();
     if (agent.ctl === ctl) {
-      agent.ctl = null; setSendMode(false); addTurnControls(); markFresh("claude");
+      agent.ctl = null; setSendMode(false); addTurnControls(); markFresh("agent");
+      saveAgent();
       if (!ctl.signal.aborted && agent.queue.length) flushQueue();
     }
-    saveAgent();
   }
   return { reply, box };
 }
@@ -923,9 +927,10 @@ function sendChat() {
   return true;
 }
 
-// ---- stop / queue / interrupt: while Claude works, the send button stops it and new messages queue behind it ----
+// ---- stop / queue / interrupt: while the assistant works, the send button stops it and new messages queue behind it ----
 agent.queue = [];
 function setSendMode(busy) {
+  $("#a-provider").disabled = busy;
   const b = $("#a-send"); b.disabled = false; b.classList.toggle("stop", busy);
   b.textContent = busy ? "■" : "↑"; b.title = busy ? "stop" : "send"; b.setAttribute("aria-label", busy ? "stop" : "send");
 }
@@ -974,7 +979,7 @@ agentEl.addEventListener("dragleave", e => { if (!agentEl.contains(e.relatedTarg
 agentEl.addEventListener("drop", e => { if (!e.dataTransfer?.files?.length) return; e.preventDefault(); agentEl.classList.remove("drop"); attachFiles([...e.dataTransfer.files]); });
 $("#a-input").addEventListener("paste", e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); attachFiles(fs); } });
 
-// ---- edit / reroll the latest turn: cut the claude session back to before it, then resend or hand it back ----
+// ---- edit / reroll the latest turn: rewind the CLI session back to before it, then resend or hand it back ----
 function clearTurnControls() { document.querySelectorAll("#a-thread .a-ctl").forEach(x => x.remove()); }
 function lastTurn() {
   const users = [...document.querySelectorAll("#a-thread .a-msg.user")], u = users[users.length - 1];
@@ -995,7 +1000,12 @@ async function rewindLast(act) {
   if (agent.ctl) agent.ctl.abort();
   const u = t.u, msg = u.dataset.msg ?? u.childNodes[0]?.textContent ?? "", shown = u.dataset.shown ?? msg;
   const cls = u.dataset.cls || "user", atts = JSON.parse(u.dataset.att || "[]");
-  if (agent.chat) { try { await api("/api/agent/rewind", { chat: agent.chat, text: msg }); } catch {} }
+  if (agent.chat) {
+    try {
+      const result = await api("/api/agent/rewind", { provider: agent.provider, chat: agent.chat, text: msg });
+      if (!result.ok) throw new Error(result.error || "Could not rewind conversation");
+    } catch (err) { addMsg("assistant", `<div class="a-err">${esc(String(err.message || err))}</div>`); return; }
+  }
   for (const x of [u, ...t.after]) x.remove();
   if (!$("#a-thread").children.length) $("#a-thread").innerHTML = EMPTY;
   if (act === "reroll") agentTurn(msg, shown, cls, atts);
@@ -1004,15 +1014,30 @@ async function rewindLast(act) {
 $("#a-thread").addEventListener("click", e => { const b = e.target.closest(".a-ctl button"); if (b) rewindLast(b.dataset.act); });
 function growInput() { const t = $("#a-input"); t.style.height = "auto"; t.style.height = `${Math.min(200, t.scrollHeight)}px`; }
 $("#a-input").addEventListener("input", growInput);
-// Enter sends; while Claude works it interrupts and sends now (steer); Cmd/Ctrl+Enter queues behind the reply instead
+// Enter sends; while the assistant works it interrupts and sends now (steer); Cmd/Ctrl+Enter queues behind the reply instead
 $("#a-input").addEventListener("keydown", e => {
   if (e.key !== "Enter" || e.shiftKey) return;
   e.preventDefault();
   if (agent.ctl && !(e.metaKey || e.ctrlKey)) { if (sendChat()) { stopAgent(); setTimeout(flushQueue, 50); } }
   else sendChat();
 });
-// the button sends, or stops while Claude works (Enter still sends, which queues while it works)
+// the button sends, or stops while the assistant works (Enter still sends, which queues while it works)
 $("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.ctl) stopAgent(); else sendChat(); });
 $("#a-new").onclick = () => { resetAgent(); clearAgentMarks(); };
-loadAgent(); renderAgentActions();
+function showProvider() {
+  $("#a-provider").value = agent.provider;
+  const label = agent.provider === "codex" ? "Codex" : "Claude";
+  tabBtn("agent").textContent = label;
+  $("#a-input").placeholder = `Ask ${label}…`;
+  syncEdge();
+}
+$("#a-provider").addEventListener("change", e => {
+  saveAgent();
+  agent.provider = e.target.value; agent.chat = null; agent.queue = [];
+  $("#a-thread").innerHTML = EMPTY; clearAgentMarks();
+  try { localStorage.setItem(`${AGENT_KEY}.provider`, agent.provider); } catch {}
+  loadAgent(); showProvider();
+});
+try { if (localStorage.getItem(`${AGENT_KEY}.provider`) === "codex") agent.provider = "codex"; } catch {}
+loadAgent(); showProvider(); renderAgentActions();
 syncEdge(); updateInsets();
